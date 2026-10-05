@@ -34,6 +34,7 @@ const COPY = {
     loading: '读取中',
     failed: '查询失败',
     stale: '数据可能已过期',
+    authRejected: '凭证已被服务商拒绝，请重新授权',
     requestFailed: '刷新失败，显示上次成功数据',
     available: '可用额度',
     used: '本期已用',
@@ -71,6 +72,7 @@ const COPY = {
     loading: 'Loading',
     failed: 'Query failed',
     stale: 'Data may be stale',
+    authRejected: 'Credential rejected by provider — re-authorize',
     requestFailed: 'Refresh failed; showing last successful data',
     available: 'Available credits',
     used: 'Used this cycle',
@@ -322,7 +324,7 @@ function kvRow(doc, label, value) {
 /** GLM summary row view model: fixed 5h-window percent plus today's compact tokens. */
 function glmRowModel(provider) {
   if (provider?.status === 'missing') return null
-  if (provider?.status === 'error') return { kind: 'error', label: 'GLM', error: provider.error }
+  if (provider?.status === 'error') return { kind: 'error', label: 'GLM', error: provider.error, errorKind: provider.errorKind }
   const windows = provider?.plan?.windows
   if (!Array.isArray(windows) || windows.length === 0) return null
   const five = windows.find((window) => window?.key === '5h')
@@ -335,6 +337,7 @@ function glmRowModel(provider) {
     percent: five?.percent,
     stale: provider.status === 'stale',
     error: provider.error,
+    errorKind: provider.errorKind,
     extra: tokens,
   }
 }
@@ -342,7 +345,7 @@ function glmRowModel(provider) {
 /** Copilot summary row view model: used% inverted from the reported remaining percent. */
 function copilotRowModel(provider) {
   if (provider?.status === 'missing') return null
-  if (provider?.status === 'error') return { kind: 'error', label: 'Copilot', error: provider.error }
+  if (provider?.status === 'error') return { kind: 'error', label: 'Copilot', error: provider.error, errorKind: provider.errorKind }
   const quota = provider?.quota
   if (quota?.balanceAvailable !== true) return null
   const used = remainingToUsed(quota.percentRemaining)
@@ -353,6 +356,7 @@ function copilotRowModel(provider) {
     percent: used,
     stale: provider.status === 'stale',
     error: provider.error,
+    errorKind: provider.errorKind,
     extra: typeof quota.creditsUsed === 'number' && quota.creditsUsed >= 0 ? quota.creditsUsed : undefined,
   }
 }
@@ -695,7 +699,9 @@ export function mountQuotaCard({
     if (model.stale) {
       const mark = text(doc, 'span', 'dqw-stale-mark', '⚠')
       mark.dataset.dshQuotaWatchStale = ''
-      mark.title = model.error ?? copy.stale
+      mark.title = model.errorKind === 'auth' && model.error
+        ? `${copy.authRejected}: ${model.error}`
+        : (model.error ?? copy.stale)
       row.append(mark)
     }
     row.append(text(doc, 'span', 'dqw-pct', typeof model.percent === 'number' ? formatPercent(model.percent, locale) : '—'))
@@ -793,7 +799,8 @@ export function mountQuotaCard({
     detail.replaceChildren()
     detail.append(panelHeader({ title: copy.providerNames[key], showBack: fromPanelNav }))
     if (provider?.status === 'stale') {
-      detail.append(text(doc, 'p', 'dqw-error', `${copy.stale}${provider.error ? `: ${provider.error}` : ''}`))
+      const bannerPrefix = provider.errorKind === 'auth' ? copy.authRejected : copy.stale
+      detail.append(text(doc, 'p', 'dqw-error', `${bannerPrefix}${provider.error ? `: ${provider.error}` : ''}`))
     }
     if (key === 'glm') {
       const usage = provider?.usage

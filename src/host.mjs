@@ -77,11 +77,17 @@ function initialProvider(key, displayName) {
   return { key, displayName, status: 'loading', credential: 'unknown' }
 }
 
-function safeProbeError(error) {
-  if (error?.name === 'TimeoutError' || error?.name === 'AbortError') return '请求超时'
-  if (Number.isInteger(error?.status)) return `HTTP ${error.status}`
-  if (error?.code === 'UNRECOGNIZED_RESPONSE') return '服务商响应格式无法识别'
-  return '探测失败'
+/** Classify a probe failure into a user-facing message and a stable kind for the client. */
+export function classifyProbeError(error) {
+  if (error?.name === 'TimeoutError' || error?.name === 'AbortError') return { message: '请求超时', kind: 'network' }
+  if (Number.isInteger(error?.status)) {
+    if (error.status === 401 || error.status === 403) return { message: `HTTP ${error.status}`, kind: 'auth' }
+    return { message: `HTTP ${error.status}`, kind: 'server' }
+  }
+  if (error?.code === 'UNRECOGNIZED_RESPONSE') return { message: '服务商响应格式无法识别', kind: 'parse' }
+  const causeCode = String(error?.cause?.code ?? '')
+  if (/^[A-Z0-9_]{3,60}$/.test(causeCode)) return { message: `探测失败 (${causeCode})`, kind: 'network' }
+  return { message: '探测失败', kind: 'network' }
 }
 
 function responseJson(res, status, body) {
@@ -117,6 +123,7 @@ export function createQuotaService(ctx, options = {}) {
   let pollPromise
   let timer
   let disposed = false
+  let coldAttempts = 0
 
   function view() {
     return {
@@ -131,6 +138,7 @@ export function createQuotaService(ctx, options = {}) {
           ...(provider.updatedAt !== undefined ? { updatedAt: provider.updatedAt } : {}),
           ...(provider.checkedAt !== undefined ? { checkedAt: provider.checkedAt } : {}),
           ...(provider.error !== undefined ? { error: provider.error } : {}),
+          ...(provider.errorKind !== undefined ? { errorKind: provider.errorKind } : {}),
           ...(provider.plan !== undefined ? { plan: provider.plan } : {}),
           ...(provider.quota !== undefined ? { quota: provider.quota } : {}),
           ...(provider.usage !== undefined ? { usage: provider.usage } : {}),
@@ -139,7 +147,16 @@ export function createQuotaService(ctx, options = {}) {
     }
   }
 
+  /** Log one real state transition; degradations warn, recoveries and missing-credentials inform. */
+  function logTransition(key, from, to, detail) {
+    if (from === to) return
+    const line = `quota-watch: ${key} ${from}→${to}${detail ? ` (${detail})` : ''}`
+    if (to === 'error' || to === 'stale') ctx.logger?.warn?.(line)
+    else ctx.logger?.info?.(line)
+  }
+
   function markMissing(key, displayName) {
+    const from = providers.get(key)?.status
     providers.set(key, {
       key,
       displayName,
@@ -147,9 +164,11 @@ export function createQuotaService(ctx, options = {}) {
       credential: 'none',
       checkedAt: now(),
     })
+    logTransition(key, from, 'missing')
   }
 
   function markSuccess(key, displayName, payload) {
+    const from = providers.get(key)?.status
     const at = now()
     providers.set(key, {
       key,
@@ -160,6 +179,7 @@ export function createQuotaService(ctx, options = {}) {
       checkedAt: at,
       ...payload,
     })
+    logTransition(key, from, 'ready')
   }
 
   function markGlmPlanSuccess(plan) {
@@ -175,6 +195,7 @@ export function createQuotaService(ctx, options = {}) {
       plan,
       ...(previous?.usage !== undefined ? { usage: previous.usage } : {}),
     })
+    logTransition('glm', previous?.status, 'ready')
   }
 
   function markGlmUsageSuccess(usage) {
@@ -189,6 +210,7 @@ export function createQuotaService(ctx, options = {}) {
       checkedAt: at,
       usage: { status: 'ready', updatedAt: at, ...usage },
     })
+    logTransition('glm-usage', previous.usage?.status ?? 'loading', 'ready')
   }
 
   function markGlmUsageFailure(error) {
@@ -197,27 +219,35 @@ export function createQuotaService(ctx, options = {}) {
     const lastGood = previous.usage?.status === 'ready' || previous.usage?.status === 'stale'
       ? previous.usage
       : undefined
+    const { message, kind } = classifyProbeError(error)
+    const status = lastGood !== undefined ? 'stale' : 'error'
     providers.set('glm', {
       ...previous,
       checkedAt: now(),
       usage: {
         ...(lastGood !== undefined ? lastGood : {}),
-        status: lastGood !== undefined ? 'stale' : 'error',
-        error: safeProbeError(error),
+        status,
+        error: message,
+        errorKind: kind,
       },
     })
+    logTransition('glm-usage', previous.usage?.status ?? 'loading', status, message)
   }
 
   function markFailure(key, displayName, error) {
     const previous = providers.get(key)
     const checkedAt = now()
     const hasLastGood = previous?.status === 'ready' || previous?.status === 'stale'
+    const { message, kind } = classifyProbeError(error)
+    const status = hasLastGood ? 'stale' : 'error'
     providers.set(key, {
       ...(hasLastGood ? previous : { key, displayName, credential: 'configured' }),
-      status: hasLastGood ? 'stale' : 'error',
+      status,
       checkedAt,
-      error: safeProbeError(error),
+      error: message,
+      errorKind: kind,
     })
+    logTransition(key, previous?.status, status, message)
   }
 
   async function fetchBody(spec) {
@@ -311,18 +341,23 @@ export function createQuotaService(ctx, options = {}) {
     timer = setTimeout(async () => {
       timer = undefined
       await refresh()
-      // Cold-start retry: until at least one provider has reached ready/stale,
-      // a failed or still-loading round re-arms shortly instead of waiting a
-      // full interval — a desktop cold start with a slow network would
-      // otherwise stare at no capsule for up to a minute. (updatedAt alone
-      // cannot signal "cold": refresh() stamps it even when every probe
-      // failed.) All-'missing' (no credentials configured) and warm states
-      // keep the normal cadence, so nobody without credentials gets
-      // high-frequency probing.
+      // Cold-start retry with capped exponential backoff: until at least one
+      // provider has reached ready/stale, a failed or still-loading round re-arms
+      // at coldRetryMs, doubling per consecutive retryable round and capping at
+      // the normal cadence — a desktop cold start with a slow network still gets
+      // fast early retries, but a persistently broken state (e.g. a rejected
+      // credential) can no longer hammer the upstream every few seconds forever.
+      // Any non-retryable round (success, or all-missing) resets the counter, so
+      // a later cold phase restarts from the short interval. (updatedAt alone
+      // cannot signal "cold": refresh() stamps it even when every probe failed.)
       const states = [...providers.values()].map((provider) => provider.status)
       const retryable = states.some((status) => status === 'loading' || status === 'error')
         && states.every((status) => status !== 'ready' && status !== 'stale')
-      schedule(retryable ? (options.coldRetryMs ?? 5_000) : pollIntervalSec * 1000)
+      if (retryable) coldAttempts += 1
+      else coldAttempts = 0
+      schedule(retryable
+        ? Math.min((options.coldRetryMs ?? 5_000) * 2 ** (coldAttempts - 1), pollIntervalSec * 1000)
+        : pollIntervalSec * 1000)
     }, delayMs)
     timer.unref?.()
   }

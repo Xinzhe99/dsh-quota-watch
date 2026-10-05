@@ -1261,6 +1261,43 @@ test('stale detail leads with the degradation banner', async () => {
   window.close()
 })
 
+test('auth-class failures lead with the re-authorize copy across banner and row tooltips', async () => {
+  const window = dom()
+  const copilotAuth = copilotProvider({ status: 'stale', error: 'HTTP 401', errorKind: 'auth' })
+  const glmAuth = glmProvider({ status: 'stale', error: 'HTTP 403', errorKind: 'auth' })
+  glmAuth.usage = { ...glmAuth.usage, status: 'stale' }
+  const { dispose } = await mounted(window, snapshot([glmAuth, copilotAuth]))
+  const card = window.document.querySelector('[data-dsh-quota-watch-card]').shadowRoot
+  assert.equal(
+    card.querySelector('[data-dsh-quota-watch-row="copilot"]').querySelector('[data-dsh-quota-watch-stale]').title,
+    'Credential rejected by provider — re-authorize: HTTP 401',
+  )
+  assert.equal(
+    card.querySelector('[data-dsh-quota-watch-row="glm"]').querySelector('[data-dsh-quota-watch-stale]').title,
+    'Credential rejected by provider — re-authorize: HTTP 403',
+  )
+  card.querySelector('[data-dsh-quota-watch-row="copilot"]').dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
+  await turn()
+  const detail = window.document.querySelector('[data-dsh-quota-watch-float]').shadowRoot.querySelector('[data-dsh-quota-watch-panel-detail="copilot"]')
+  assert.match(detail.querySelector('.dqw-error').textContent, /Credential rejected by provider — re-authorize: HTTP 401/)
+  dispose()
+  window.close()
+})
+
+test('non-auth failures keep the stale copy in banner and tooltip', async () => {
+  const window = dom()
+  const copilotServer = copilotProvider({ status: 'stale', error: 'HTTP 503' })
+  const { dispose } = await mounted(window, snapshot([copilotServer]))
+  const row = window.document.querySelector('[data-dsh-quota-watch-card]').shadowRoot.querySelector('[data-dsh-quota-watch-row="copilot"]')
+  assert.equal(row.querySelector('[data-dsh-quota-watch-stale]').title, 'HTTP 503')
+  row.dispatchEvent(new window.MouseEvent('click', { bubbles: true }))
+  await turn()
+  const detail = window.document.querySelector('[data-dsh-quota-watch-float]').shadowRoot.querySelector('[data-dsh-quota-watch-panel-detail="copilot"]')
+  assert.match(detail.querySelector('.dqw-error').textContent, /Data may be stale: HTTP 503/)
+  dispose()
+  window.close()
+})
+
 test('hidden pages pause the client poll timer and visibility resumes it', async () => {
   const window = dom()
   let calls = 0

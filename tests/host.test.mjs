@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
-import { createQuotaService, makeOverviewRoute, makeRefreshRoute } from '../src/host.mjs'
+import { classifyProbeError, createQuotaService, makeOverviewRoute, makeRefreshRoute } from '../src/host.mjs'
 
 const fixtureDir = resolve(dirname(fileURLToPath(import.meta.url)), 'fixtures')
 const glmBody = JSON.parse(await readFile(resolve(fixtureDir, 'glm-plan-response.json'), 'utf8'))
@@ -16,7 +16,7 @@ function providerBody(url) {
   return copilotBody
 }
 
-function makeContext({ glmKey = 'synthetic-glm-key', githubOAuth = 'synthetic-github-oauth' } = {}) {
+function makeContext({ glmKey = 'synthetic-glm-key', githubOAuth = 'synthetic-github-oauth', logger } = {}) {
   return {
     settings: {
       describe: () => [{ ns: 'llm-pi-ai', value: { providers: {
@@ -29,6 +29,7 @@ function makeContext({ glmKey = 'synthetic-glm-key', githubOAuth = 'synthetic-gi
         type: 'oauth', refresh: githubOAuth, access: 'synthetic-short-lived-copilot-token',
       } }),
     },
+    ...(logger ? { logger } : {}),
   }
 }
 
@@ -88,6 +89,35 @@ test('later refresh resolves rotated credentials instead of reusing old values',
   assert.equal(seen.filter((request) => request.url.includes('api.github.com')).at(-1).authorization, 'Bearer synthetic-github-rotated')
 })
 
+test('classifyProbeError maps probe failures to kinds and messages', () => {
+  assert.deepEqual(classifyProbeError(Object.assign(new Error(), { name: 'TimeoutError' })), { message: '请求超时', kind: 'network' })
+  assert.deepEqual(classifyProbeError(Object.assign(new Error(), { name: 'AbortError' })), { message: '请求超时', kind: 'network' })
+  assert.deepEqual(classifyProbeError(Object.assign(new Error(), { status: 401 })), { message: 'HTTP 401', kind: 'auth' })
+  assert.deepEqual(classifyProbeError(Object.assign(new Error(), { status: 403 })), { message: 'HTTP 403', kind: 'auth' })
+  assert.deepEqual(classifyProbeError(Object.assign(new Error(), { status: 503 })), { message: 'HTTP 503', kind: 'server' })
+  assert.deepEqual(classifyProbeError(Object.assign(new Error(), { code: 'UNRECOGNIZED_RESPONSE' })), { message: '服务商响应格式无法识别', kind: 'parse' })
+  assert.deepEqual(
+    classifyProbeError(Object.assign(new Error('fetch failed'), { cause: { code: 'ECONNRESET' } })),
+    { message: '探测失败 (ECONNRESET)', kind: 'network' },
+  )
+  assert.deepEqual(classifyProbeError(new Error('boom')), { message: '探测失败', kind: 'network' })
+})
+
+test('auth failures expose errorKind in the overview snapshot', async () => {
+  const context = makeContext()
+  const fetchImpl = async (url) => {
+    if (url.includes('api.github.com')) return new Response('unauthorized', { status: 401 })
+    return new Response(JSON.stringify(providerBody(url)), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  const service = createQuotaService(context, { fetchImpl })
+  await service.refresh()
+
+  const copilot = service.overview().providers.find((provider) => provider.key === 'copilot')
+  assert.equal(copilot.status, 'error', 'first-round failure has no last-good to fall back on')
+  assert.equal(copilot.error, 'HTTP 401')
+  assert.equal(copilot.errorKind, 'auth')
+})
+
 test('probe failures retain last-good quota and report stale status without clearing values', async () => {
   let failing = false
   const context = makeContext()
@@ -107,8 +137,10 @@ test('probe failures retain last-good quota and report stale status without clea
   assert.equal(glm.plan.windows.length, 4)
   assert.equal(copilot.status, 'stale')
   assert.equal(copilot.quota.remaining, 7600)
-  assert.ok(glm.error)
-  assert.ok(copilot.error)
+  assert.equal(glm.error, 'HTTP 503')
+  assert.equal(glm.errorKind, 'server')
+  assert.equal(copilot.error, 'HTTP 503')
+  assert.equal(copilot.errorKind, 'server')
 })
 
 test('usage probe failure keeps the plan ready and degrades only the usage block', async () => {
@@ -146,7 +178,8 @@ test('usage probe failure without last-good data reports an error block, not a r
   assert.equal(glm.plan.windows.length, 4)
   assert.equal(glm.usage.status, 'error')
   assert.equal(glm.usage.totalTokens, undefined)
-  assert.ok(glm.usage.error)
+  assert.equal(glm.usage.error, '服务商响应格式无法识别', 'a 200 with an unparseable body is a parse failure, not a server failure')
+  assert.equal(glm.usage.errorKind, 'parse')
 })
 
 test('missing credentials are reported without making provider requests', async () => {
@@ -161,6 +194,66 @@ test('missing credentials are reported without making provider requests', async 
   assert.equal(calls, 0)
   assert.equal(service.overview().providers.find((provider) => provider.key === 'glm').status, 'missing')
   assert.equal(service.overview().providers.find((provider) => provider.key === 'copilot').status, 'missing')
+})
+
+function recordingLogger() {
+  const logs = { warn: [], info: [] }
+  return { logs, logger: { warn: (line) => logs.warn.push(line), info: (line) => logs.info.push(line) } }
+}
+
+test('probe state transitions are logged once per real transition with kind-aware detail', async () => {
+  const { logs, logger } = recordingLogger()
+  const context = makeContext({ logger })
+  let usageFailing = false
+  let failing = false
+  const fetchImpl = async (url) => {
+    if (failing) return new Response('{}', { status: url.includes('api.github.com') ? 401 : 503 })
+    if (usageFailing && url.includes('model-usage')) return new Response('{}', { status: 500 })
+    return new Response(JSON.stringify(providerBody(url)), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  const service = createQuotaService(context, { fetchImpl })
+  await service.refresh()
+  assert.ok(logs.info.some((line) => line.includes('quota-watch: glm loading→ready')), logs.info)
+  assert.ok(logs.info.some((line) => line.includes('quota-watch: glm-usage loading→ready')), logs.info)
+  assert.ok(logs.info.some((line) => line.includes('quota-watch: copilot loading→ready')), logs.info)
+  assert.equal(logs.warn.length, 0)
+
+  usageFailing = true
+  await service.refresh()
+  assert.ok(logs.warn.some((line) => line.includes('quota-watch: glm-usage ready→stale (HTTP 500)')), logs.warn)
+
+  usageFailing = false
+  await service.refresh()
+  assert.ok(logs.info.some((line) => line.includes('quota-watch: glm-usage stale→ready')), logs.info)
+
+  failing = true
+  await service.refresh()
+  assert.ok(logs.warn.some((line) => line.includes('quota-watch: glm ready→stale (HTTP 503)')), logs.warn)
+  assert.ok(logs.warn.some((line) => line.includes('quota-watch: copilot ready→stale (HTTP 401)')), logs.warn)
+
+  failing = false
+  await service.refresh()
+  assert.ok(logs.info.some((line) => line.includes('quota-watch: glm stale→ready')), logs.info)
+  assert.ok(logs.info.some((line) => line.includes('quota-watch: copilot stale→ready')), logs.info)
+
+  const warnCount = logs.warn.length
+  const infoCount = logs.info.length
+  await service.refresh()
+  assert.equal(logs.warn.length, warnCount, 'steady-state rounds emit no warnings')
+  assert.equal(logs.info.length, infoCount, 'steady-state rounds emit no infos')
+})
+
+test('missing credentials log an informational transition without probing', async () => {
+  const { logs, logger } = recordingLogger()
+  const context = makeContext({ glmKey: '', githubOAuth: '', logger })
+  let calls = 0
+  const service = createQuotaService(context, { fetchImpl: async () => { calls += 1; throw new Error('unexpected fetch') } })
+  await service.refresh()
+
+  assert.equal(calls, 0)
+  assert.ok(logs.info.some((line) => line.includes('quota-watch: glm loading→missing')), logs.info)
+  assert.ok(logs.info.some((line) => line.includes('quota-watch: copilot loading→missing')), logs.info)
+  assert.equal(logs.warn.length, 0, 'missing credentials are not a degradation')
 })
 
 function fakeResponse() {
@@ -230,6 +323,105 @@ test('loopback access requires a loopback socket and ignores forwarded address h
   assert.equal(spoofed.statusCode, 403)
 })
 
+test('cold retries back off exponentially and cap at the normal cadence', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const flush = async () => {
+    for (let hop = 0; hop < 8; hop += 1) await new Promise((resolve) => setImmediate(resolve))
+  }
+  let attempts = 0
+  const context = makeContext()
+  const fetchImpl = async () => {
+    attempts += 1
+    throw new Error('still down')
+  }
+  const service = createQuotaService(context, { fetchImpl, now: () => 1_800_000_000_000, pollIntervalSec: 60, coldRetryMs: 5_000 })
+  try {
+    service.start()
+    t.mock.timers.tick(0)
+    await flush()
+    assert.equal(attempts, 2, 'start() probes both providers immediately')
+    // Each retryable round doubles the armed delay (capped at the normal cadence).
+    // A tick shorter than the armed delay must fire nothing — that no-fire check is
+    // what actually discriminates backoff from the legacy constant short interval,
+    // because a completed round re-arms its timer only after the flush, so any tick
+    // >= the armed delay fires exactly one round under either implementation.
+    const steps = [
+      [4_000, 2, 'first backoff stage is 5s: 4s must not fire'],
+      [1_000, 4, null],
+      [9_000, 4, 'second backoff stage is 10s: 9s must not fire'],
+      [1_000, 6, null],
+      [19_000, 6, 'third backoff stage is 20s: 19s must not fire'],
+      [1_000, 8, null],
+      [39_000, 8, 'fourth backoff stage is 40s: 39s must not fire'],
+      [1_000, 10, null],
+      [59_000, 10, 'fifth backoff stage is capped at 60s: 59s must not fire'],
+      [1_000, 12, null],
+      [59_000, 12, 'the cap holds: 59s must not fire'],
+      [1_000, 14, null],
+    ]
+    for (const [tickMs, expected, message] of steps) {
+      t.mock.timers.tick(tickMs)
+      await flush()
+      assert.equal(attempts, expected, message ?? `tick(${tickMs}) fires the due retryable round`)
+    }
+  } finally {
+    service.stop()
+    t.mock.timers.reset()
+  }
+})
+
+test('cold retry backoff resets after a successful round and restarts from the short interval', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const flush = async () => {
+    for (let hop = 0; hop < 8; hop += 1) await new Promise((resolve) => setImmediate(resolve))
+  }
+  let glmAttempts = 0
+  let copilotAttempts = 0
+  let glmWorks = false
+  let glmKey = 'synthetic-glm-key'
+  const context = makeContext()
+  context.credentials.resolve = async () => glmKey ? { value: glmKey } : undefined
+  const fetchImpl = async (url) => {
+    if (url.includes('api.github.com')) {
+      copilotAttempts += 1
+      return new Response('unauthorized', { status: 401 })
+    }
+    glmAttempts += 1
+    if (!glmWorks) throw new Error('glm down')
+    return new Response(JSON.stringify(providerBody(url)), { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  const service = createQuotaService(context, { fetchImpl, now: () => 1_800_000_000_000, pollIntervalSec: 60, coldRetryMs: 5_000 })
+  try {
+    service.start()
+    t.mock.timers.tick(0)
+    await flush()
+    assert.equal(glmAttempts, 1)
+    assert.equal(copilotAttempts, 1)
+    t.mock.timers.tick(5_000)
+    await flush()
+    assert.equal(glmAttempts, 2, 'round 2 fires at the short interval')
+    assert.equal(copilotAttempts, 2)
+    glmWorks = true
+    t.mock.timers.tick(10_000)
+    await flush()
+    assert.equal(glmAttempts, 4, 'the recovering round probes glm plan + usage')
+    assert.equal(copilotAttempts, 3)
+    assert.equal(service.overview().providers.find((provider) => provider.key === 'glm').status, 'ready')
+    glmKey = ''
+    t.mock.timers.tick(60_000)
+    await flush()
+    assert.equal(glmAttempts, 4, 'a missing credential probes nothing')
+    assert.equal(copilotAttempts, 4)
+    assert.equal(service.overview().providers.find((provider) => provider.key === 'glm').status, 'missing')
+    t.mock.timers.tick(5_000)
+    await flush()
+    assert.equal(copilotAttempts, 5, 'the retryable delay restarted from the short interval after the reset (a missing reset would wait >=20s)')
+  } finally {
+    service.stop()
+    t.mock.timers.reset()
+  }
+})
+
 test('cold start probes immediately, retries fast while failing, and warms to the normal cadence', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] })
   // A completed refresh() is several awaits deep; setImmediate is NOT mocked,
@@ -253,9 +445,9 @@ test('cold start probes immediately, retries fast while failing, and warms to th
     t.mock.timers.tick(5_000)
     await flush()
     assert.equal(attempts, 4, 'a failed cold round re-probes at the short cold interval')
-    t.mock.timers.tick(5_000)
+    t.mock.timers.tick(10_000)
     await flush()
-    assert.equal(attempts, 7, 'the recovering round succeeds (glm plan + glm usage + copilot)')
+    assert.equal(attempts, 7, 'the recovering round succeeds (glm plan + glm usage + copilot); its tick doubled with the backoff')
     const overview = service.overview()
     assert.equal(overview.providers.find((provider) => provider.key === 'glm').status, 'ready')
     t.mock.timers.tick(5_000)

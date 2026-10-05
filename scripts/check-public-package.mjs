@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process'
 import { readFile, readdir } from 'node:fs/promises'
-import { dirname, relative, resolve } from 'node:path'
+import { dirname, isAbsolute, relative, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -89,21 +89,35 @@ function commitMetadataFinding() {
   }
 }
 
-export function parseNpmPackManifest(output) {
-  const parsed = JSON.parse(output)
-  const candidates = Array.isArray(parsed) ? parsed : Object.values(parsed ?? {})
-  const manifest = candidates.find((candidate) => Array.isArray(candidate?.files))
-  if (manifest === undefined) throw new Error('npm pack did not return a file manifest')
-  return manifest.files.map((file) => file.path).filter((path) => typeof path === 'string')
+/** Match one package.json `files` entry (exact path, directory, or glob) against a repo-relative path. */
+export function filePatternMatcher(pattern) {
+  if (!/[*?]/.test(pattern)) {
+    return (rel) => rel === pattern || rel.startsWith(`${pattern}/`)
+  }
+  const regex = new RegExp(`^${pattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*\*\//g, '(?:.*/)?')
+    .replace(/\*\*/g, '.*')
+    .replace(/\*/g, '[^/]*')}$`)
+  return (rel) => regex.test(rel)
 }
 
-function npmPackFiles() {
-  const output = execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts', '--loglevel=silent'], {
-    cwd: ROOT,
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
-  return parseNpmPackManifest(output)
+/** Derive the would-be npm pack file list from the package.json `files` allowlist.
+ * npm ≥11 emits no manifest at all for `pack --dry-run --ignore-scripts` (the only
+ * way to run pack inside this check without recursing through prepack), so the list
+ * is derived offline instead. Scanning a superset is safe: the worktree scan above
+ * already covers every file. */
+export function derivePackFiles(worktreeFiles, pkg) {
+  const patterns = [
+    ...(Array.isArray(pkg?.files) ? pkg.files : []),
+    'package.json',
+    'README.md',
+    'LICENSE',
+  ]
+  const matchers = patterns.map(filePatternMatcher)
+  return worktreeFiles
+    .map((absolute) => (isAbsolute(absolute) ? relative(ROOT, absolute) : absolute))
+    .filter((rel) => matchers.some((matcher) => matcher(rel)))
 }
 
 async function check() {
@@ -128,7 +142,8 @@ async function check() {
 
   let packFiles
   try {
-    packFiles = npmPackFiles()
+    const pkg = JSON.parse(await readFile(resolve(ROOT, 'package.json'), 'utf8'))
+    packFiles = derivePackFiles(worktreeFiles, pkg)
   } catch {
     findings.push({ path: 'npm pack manifest', rule: 'pack-manifest-unavailable' })
     packFiles = []

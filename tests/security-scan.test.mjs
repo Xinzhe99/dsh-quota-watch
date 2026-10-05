@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
-import { findSecretRules, isGitHubNoreplyEmail, isSensitivePath, parseNpmPackManifest } from '../scripts/check-public-package.mjs'
+import { derivePackFiles, filePatternMatcher, findSecretRules, isGitHubNoreplyEmail, isSensitivePath } from '../scripts/check-public-package.mjs'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -36,9 +36,36 @@ test('project ignore rules protect local npm credentials', async () => {
   assert.doesNotMatch(ignore, /^docs\/plans\/$/m)
 })
 
-test('pack manifest parser supports npm 11 array and npm 12 keyed-object output', () => {
-  assert.deepEqual(parseNpmPackManifest(JSON.stringify([{ files: [{ path: 'README.md' }] }])), ['README.md'])
-  assert.deepEqual(parseNpmPackManifest(JSON.stringify({ 'pkg@0.0.1': { files: [{ path: 'src/host.mjs' }] } })), ['src/host.mjs'])
+test('pack manifest derivation expands the package.json files allowlist offline', () => {
+  const worktree = [
+    resolve(root, 'package.json'),
+    resolve(root, 'README.md'),
+    resolve(root, 'LICENSE'),
+    resolve(root, 'src/host.mjs'),
+    resolve(root, 'src/client.mjs'),
+    resolve(root, 'src/core/adapters.mjs'),
+    resolve(root, 'lib/client.js'),
+    resolve(root, 'docs/assets/panel.png'),
+    resolve(root, 'cordis.patch.yml'),
+    resolve(root, 'tests/host.test.mjs'),
+  ]
+  const pkg = { files: ['src/**/*.mjs', 'lib/client.js', 'docs/assets', 'cordis.patch.yml', 'README.md', 'LICENSE'] }
+  const files = derivePackFiles(worktree, pkg)
+  for (const expected of ['package.json', 'README.md', 'LICENSE', 'src/host.mjs', 'src/core/adapters.mjs', 'lib/client.js', 'docs/assets/panel.png', 'cordis.patch.yml']) {
+    assert.ok(files.includes(expected), `expected ${expected} in the derived pack list`)
+  }
+  assert.equal(files.includes('tests/host.test.mjs'), false, 'tests are not packed')
+  assert.deepEqual(derivePackFiles(['src/host.mjs'], pkg).includes('src/host.mjs'), true, 'already-relative paths pass through')
+})
+
+test('file pattern matcher treats directory entries as prefixes and globs as minimatch', () => {
+  const dir = filePatternMatcher('docs/assets')
+  assert.equal(dir('docs/assets/panel.png'), true)
+  assert.equal(dir('docs/assets-backup/panel.png'), false)
+  const glob = filePatternMatcher('src/**/*.mjs')
+  assert.equal(glob('src/host.mjs'), true, 'minimatch ** matches zero segments')
+  assert.equal(glob('src/core/adapters.mjs'), true)
+  assert.equal(glob('lib/client.js'), false)
 })
 
 test('commit privacy matcher accepts GitHub noreply addresses only', () => {

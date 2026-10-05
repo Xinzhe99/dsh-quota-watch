@@ -147,12 +147,16 @@ export function createQuotaService(ctx, options = {}) {
     }
   }
 
-  /** Log one real state transition; degradations warn, recoveries and missing-credentials inform. */
+  /** Log one real state transition; degradations warn, recoveries and missing-credentials inform.
+   * Dual-channel: ctx.logger (cordis, ring-buffer only — the host registers no journal
+   * exporter) mirrored to console so service stdout lands in journald. */
   function logTransition(key, from, to, detail) {
     if (from === to) return
     const line = `quota-watch: ${key} ${from}→${to}${detail ? ` (${detail})` : ''}`
-    if (to === 'error' || to === 'stale') ctx.logger?.warn?.(line)
+    const level = to === 'error' || to === 'stale' ? 'warn' : 'info'
+    if (level === 'warn') ctx.logger?.warn?.(line)
     else ctx.logger?.info?.(line)
+    ;(options.logMirror ?? console)[level]?.(line)
   }
 
   function markMissing(key, displayName) {

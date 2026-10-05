@@ -40,7 +40,7 @@ test('one refresh probes both providers with current secrets and returns only no
     seen.push({ url, headers: Object.fromEntries(new Headers(init.headers).entries()) })
     return new Response(JSON.stringify(providerBody(url)), { status: 200, headers: { 'content-type': 'application/json' } })
   }
-  const service = createQuotaService(context, { fetchImpl, now: () => 1_800_000_000_000 })
+  const service = createQuotaService(context, { logMirror: () => {}, fetchImpl, now: () => 1_800_000_000_000 })
 
   await service.refresh()
   const overview = service.overview()
@@ -75,7 +75,7 @@ test('later refresh resolves rotated credentials instead of reusing old values',
     seen.push({ url, authorization: new Headers(init.headers).get('authorization') })
     return new Response(JSON.stringify(providerBody(url)), { status: 200 })
   }
-  const service = createQuotaService(context, { fetchImpl })
+  const service = createQuotaService(context, { logMirror: () => {}, fetchImpl })
 
   await service.refresh()
   glmKey = 'synthetic-glm-rotated'
@@ -109,7 +109,7 @@ test('auth failures expose errorKind in the overview snapshot', async () => {
     if (url.includes('api.github.com')) return new Response('unauthorized', { status: 401 })
     return new Response(JSON.stringify(providerBody(url)), { status: 200, headers: { 'content-type': 'application/json' } })
   }
-  const service = createQuotaService(context, { fetchImpl })
+  const service = createQuotaService(context, { logMirror: () => {}, fetchImpl })
   await service.refresh()
 
   const copilot = service.overview().providers.find((provider) => provider.key === 'copilot')
@@ -125,7 +125,7 @@ test('probe failures retain last-good quota and report stale status without clea
     if (failing) return new Response('{}', { status: 503 })
     return new Response(JSON.stringify(providerBody(url)), { status: 200 })
   }
-  const service = createQuotaService(context, { fetchImpl })
+  const service = createQuotaService(context, { logMirror: () => {}, fetchImpl })
   await service.refresh()
   failing = true
   await service.refresh()
@@ -150,7 +150,7 @@ test('usage probe failure keeps the plan ready and degrades only the usage block
     if (usageFailing && url.includes('model-usage')) return new Response('{}', { status: 500 })
     return new Response(JSON.stringify(providerBody(url)), { status: 200 })
   }
-  const service = createQuotaService(context, { fetchImpl })
+  const service = createQuotaService(context, { logMirror: () => {}, fetchImpl })
   await service.refresh()
   usageFailing = true
   await service.refresh()
@@ -170,7 +170,7 @@ test('usage probe failure without last-good data reports an error block, not a r
     JSON.stringify(url.includes('model-usage') ? { success: false } : providerBody(url)),
     { status: 200 },
   )
-  const service = createQuotaService(context, { fetchImpl })
+  const service = createQuotaService(context, { logMirror: () => {}, fetchImpl })
   await service.refresh()
 
   const glm = service.overview().providers.find((provider) => provider.key === 'glm')
@@ -188,7 +188,7 @@ test('missing credentials are reported without making provider requests', async 
     credentials: { resolve: async () => undefined, readRecord: async () => undefined },
   }
   let calls = 0
-  const service = createQuotaService(context, { fetchImpl: async () => { calls += 1; throw new Error('unexpected fetch') } })
+  const service = createQuotaService(context, { logMirror: () => {}, fetchImpl: async () => { calls += 1; throw new Error('unexpected fetch') } })
   await service.refresh()
 
   assert.equal(calls, 0)
@@ -203,6 +203,7 @@ function recordingLogger() {
 
 test('probe state transitions are logged once per real transition with kind-aware detail', async () => {
   const { logs, logger } = recordingLogger()
+  const mirror = { warn: [], info: [] }
   const context = makeContext({ logger })
   let usageFailing = false
   let failing = false
@@ -211,7 +212,10 @@ test('probe state transitions are logged once per real transition with kind-awar
     if (usageFailing && url.includes('model-usage')) return new Response('{}', { status: 500 })
     return new Response(JSON.stringify(providerBody(url)), { status: 200, headers: { 'content-type': 'application/json' } })
   }
-  const service = createQuotaService(context, { fetchImpl })
+  const service = createQuotaService(context, {
+    fetchImpl,
+    logMirror: { warn: (line) => mirror.warn.push(line), info: (line) => mirror.info.push(line) },
+  })
   await service.refresh()
   assert.ok(logs.info.some((line) => line.includes('quota-watch: glm loading→ready')), logs.info)
   assert.ok(logs.info.some((line) => line.includes('quota-watch: glm-usage loading→ready')), logs.info)
@@ -241,13 +245,15 @@ test('probe state transitions are logged once per real transition with kind-awar
   await service.refresh()
   assert.equal(logs.warn.length, warnCount, 'steady-state rounds emit no warnings')
   assert.equal(logs.info.length, infoCount, 'steady-state rounds emit no infos')
+  assert.deepEqual(mirror.warn, logs.warn, 'console mirror receives every warning verbatim')
+  assert.deepEqual(mirror.info, logs.info, 'console mirror receives every info verbatim')
 })
 
 test('missing credentials log an informational transition without probing', async () => {
   const { logs, logger } = recordingLogger()
   const context = makeContext({ glmKey: '', githubOAuth: '', logger })
   let calls = 0
-  const service = createQuotaService(context, { fetchImpl: async () => { calls += 1; throw new Error('unexpected fetch') } })
+  const service = createQuotaService(context, { logMirror: () => {}, fetchImpl: async () => { calls += 1; throw new Error('unexpected fetch') } })
   await service.refresh()
 
   assert.equal(calls, 0)
@@ -334,7 +340,7 @@ test('cold retries back off exponentially and cap at the normal cadence', async 
     attempts += 1
     throw new Error('still down')
   }
-  const service = createQuotaService(context, { fetchImpl, now: () => 1_800_000_000_000, pollIntervalSec: 60, coldRetryMs: 5_000 })
+  const service = createQuotaService(context, { logMirror: () => {}, fetchImpl, now: () => 1_800_000_000_000, pollIntervalSec: 60, coldRetryMs: 5_000 })
   try {
     service.start()
     t.mock.timers.tick(0)
@@ -390,7 +396,7 @@ test('cold retry backoff resets after a successful round and restarts from the s
     if (!glmWorks) throw new Error('glm down')
     return new Response(JSON.stringify(providerBody(url)), { status: 200, headers: { 'content-type': 'application/json' } })
   }
-  const service = createQuotaService(context, { fetchImpl, now: () => 1_800_000_000_000, pollIntervalSec: 60, coldRetryMs: 5_000 })
+  const service = createQuotaService(context, { logMirror: () => {}, fetchImpl, now: () => 1_800_000_000_000, pollIntervalSec: 60, coldRetryMs: 5_000 })
   try {
     service.start()
     t.mock.timers.tick(0)
@@ -436,7 +442,7 @@ test('cold start probes immediately, retries fast while failing, and warms to th
     if (attempts <= 4) throw new Error('network not ready yet')
     return new Response(JSON.stringify(providerBody(url)), { status: 200, headers: { 'content-type': 'application/json' } })
   }
-  const service = createQuotaService(context, { fetchImpl, now: () => 1_800_000_000_000, pollIntervalSec: 60, coldRetryMs: 5_000 })
+  const service = createQuotaService(context, { logMirror: () => {}, fetchImpl, now: () => 1_800_000_000_000, pollIntervalSec: 60, coldRetryMs: 5_000 })
   try {
     service.start()
     t.mock.timers.tick(0)
@@ -473,7 +479,7 @@ test('without credentials the cold interval never engages (no high-frequency pro
     attempts += 1
     return new Response(JSON.stringify(providerBody(url)), { status: 200, headers: { 'content-type': 'application/json' } })
   }
-  const service = createQuotaService(context, { fetchImpl, now: () => 1_800_000_000_000, pollIntervalSec: 60, coldRetryMs: 5_000 })
+  const service = createQuotaService(context, { logMirror: () => {}, fetchImpl, now: () => 1_800_000_000_000, pollIntervalSec: 60, coldRetryMs: 5_000 })
   try {
     service.start()
     t.mock.timers.tick(0)

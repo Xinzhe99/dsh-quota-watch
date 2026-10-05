@@ -358,6 +358,33 @@ test('capsule spans reflect both providers', async () => {
   window.close()
 })
 
+test('0.1.24: inactive provider spans are hidden so single-provider capsule text stays centered', async () => {
+  const window = dom()
+  const { dispose } = await mounted(window, snapshot([glmProvider()]))
+  const capsule = floatSurface(window)
+  const glm = capsule.querySelector('.dqw-capsule-glm')
+  const copilot = capsule.querySelector('.dqw-capsule-copilot')
+  const sep = capsule.querySelector('.dqw-capsule-sep')
+  assert.match(glm.textContent, /GLM 13%/)
+  assert.equal(glm.hidden, false, 'the visible provider span stays mounted')
+  assert.equal(copilot.hidden, true, 'an emptied span must not linger as a flex item: the 6px gap beside it made single-provider text off center')
+  assert.equal(copilot.textContent, '', 'the inactive span is also emptied')
+  assert.equal(sep.hidden, true, 'separator stays hidden with a single provider')
+  const floatStyle = window.document.querySelector('[data-dsh-quota-watch-float]').shadowRoot.querySelector('style').textContent
+  assert.match(floatStyle, /\.dqw-capsule \[hidden\]\s*{\s*display: none/, 'capsule child spans honor hidden even if a future author display rule lands (0.1.2 lesson)')
+  dispose()
+  window.close()
+
+  const both = dom()
+  const { dispose: disposeBoth } = await mounted(both, snapshot([glmProvider(), copilotProvider()]))
+  const bothCapsule = floatSurface(both)
+  assert.equal(bothCapsule.querySelector('.dqw-capsule-glm').hidden, false)
+  assert.equal(bothCapsule.querySelector('.dqw-capsule-copilot').hidden, false)
+  assert.equal(bothCapsule.querySelector('.dqw-capsule-sep').hidden, false, 'separator returns with both providers')
+  disposeBoth()
+  both.close()
+})
+
 test('capsule spans switch color classes past usage thresholds', async () => {
   const cases = [
     { percent: 50, cls: null },

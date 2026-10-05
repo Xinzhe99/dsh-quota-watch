@@ -142,6 +142,7 @@ const FLOAT_STYLE_TEXT = `
 .dqw-capsule-glm.warn, .dqw-capsule-copilot.warn { color: var(--dsw-alias-label-warning, #d29922); }
 .dqw-capsule-glm.danger, .dqw-capsule-copilot.danger { color: var(--dsw-alias-label-danger, #c93c3c); }
 .dqw-capsule[hidden] { display: none; }
+.dqw-capsule [hidden] { display: none; }
 .dqw-capsule--dragging { cursor: grabbing; -webkit-backdrop-filter: none; backdrop-filter: none; background: var(--dsw-alias-bg-elevated, var(--dsw-alias-bg-base, #1f1f1f)); box-shadow: 0 8px 24px rgba(0,0,0,.35); transform: scale(1.04); transition: none; }
 @media (prefers-reduced-motion: no-preference) {
   .dqw-capsule[data-alert] { animation: dqw-pulse 1.6s ease-in-out infinite; }
@@ -988,6 +989,11 @@ export function mountQuotaCard({
     if (floatHost.hidden) return
     const paint = (span, model) => {
       const visible = model !== null && typeof model.percent === 'number' && Number.isFinite(model.percent)
+      // 0.1.24: an emptied span stayed mounted as a zero-width flex item, so the
+      // 6px capsule gap next to it survived and the asymmetric padding pushed
+      // single-provider text off center (the two-provider layout was fine).
+      // Hide the span outright: display:none flex items make no box, hence no gap.
+      span.hidden = !visible
       span.textContent = visible ? `${model.label} ${formatPercent(model.percent, locale)}` : ''
       span.classList.toggle('warn', visible && model.percent > 80 && model.percent <= 95)
       span.classList.toggle('danger', visible && model.percent > 95)

@@ -1,6 +1,24 @@
 # Mount the host-side quota watcher; the browser half is supplied by dsh.client.
+#
+# autoReset: when a window's used% reaches its threshold, spend the earliest-expiring
+# available reset card of that window automatically. Both windows default to disabled;
+# the panel's checkboxes persist overrides to
+#   $DSH_HOME/glm-quota-reset/settings.json
+# which win over these initial values.
+#   fiveHour.enabled / week.enabled : true to arm (default false)
+#   fiveHour.threshold / week.threshold : used-percent trigger, 50-99.9 (default 99.9)
+#   pollIntervalSec : quota check cadence in seconds (30-3600). A late threshold is
+#     only useful if the check can see the crossing — keep this well under the time
+#     a busy run takes to burn the remaining headroom.
 - insert:
     - id: quota-watch
       name: '@iasiv5/dsh-quota-watch'
       config:
         pollIntervalSec: 60
+        autoReset:
+          fiveHour:
+            enabled: false
+            threshold: 99.9
+          week:
+            enabled: false
+            threshold: 99.9

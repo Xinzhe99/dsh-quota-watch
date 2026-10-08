@@ -9,6 +9,9 @@ export const inject = []
 const CARD_SELECTOR = '[data-dsh-quota-watch-card]'
 const FLOAT_SELECTOR = '[data-dsh-quota-watch-float]'
 const FETCH_TIMEOUT_MS = 15_000
+// Mirrors the host's AUTO_RESET_DEFAULT_THRESHOLD. Used only when the host has not
+// reported a threshold yet, so the checkbox row can still render a meaningful label.
+const AUTO_RESET_THRESHOLD_FALLBACK = 99.9
 // Measured-size fallback for environments where getBoundingClientRect reports
 // zeros (jsdom) or the capsule has not painted yet.
 const FALLBACK_SIZE = { width: 38, height: 26 }
@@ -56,6 +59,32 @@ const COPY = {
       month: '每月额度',
       mcp: 'MCP（月）',
     },
+    resetCards: {
+      section: '剩余重置卡',
+      week: '每周重置卡',
+      fiveHour: '5 小时重置卡',
+      count: '{count} 张',
+      none: '无可用',
+      use: '重置',
+      reload: '刷新',
+      confirmTitle: '确认使用重置卡？',
+      confirmWeek: '将消耗 1 张每周重置卡，立即重置每周额度与 5 小时额度。',
+      confirmFiveHour: '将消耗 1 张 5 小时重置卡，立即重置 5 小时额度。',
+      confirmIrreversible: '重置卡用掉即消失，无法撤销。',
+      ok: '确认重置',
+      cancel: '取消',
+      working: '重置中…',
+      succeeded: '已重置',
+      failed: '重置失败',
+      loadFailed: '读取重置卡失败',
+      autoFiveHour: '自动用卡（5 小时）· 已用 {threshold}% 触发',
+      autoWeek: '自动用卡（每周）· 已用 {threshold}% 触发',
+      autoImmediate: '当前已用 {used}，已超阈值：开启后会立即消耗一张卡',
+      autoSaveFailed: '开关未能保存，请重试',
+      autoPersistFailed: '开关已生效，但未能写入磁盘（重启后会丢失）',
+      autoLastOk: '上次自动重置：{window} · {time}',
+      autoLastFail: '上次自动重置失败：{message}',
+    },
   },
   en: {
     title: 'Quota Watch',
@@ -95,6 +124,32 @@ const COPY = {
       week: 'Weekly quota',
       month: 'Monthly quota',
       mcp: 'MCP (month)',
+    },
+    resetCards: {
+      section: 'Reset cards left',
+      week: 'Weekly reset card',
+      fiveHour: '5-hour reset card',
+      count: '{count}',
+      none: 'none',
+      use: 'Reset',
+      reload: 'Reload',
+      confirmTitle: 'Use a reset card?',
+      confirmWeek: 'This spends 1 weekly reset card and immediately resets both the weekly and 5-hour quotas.',
+      confirmFiveHour: 'This spends 1 5-hour reset card and immediately resets the 5-hour quota.',
+      confirmIrreversible: 'The card is consumed and cannot be restored.',
+      ok: 'Use card',
+      cancel: 'Cancel',
+      working: 'Resetting…',
+      succeeded: 'Reset done',
+      failed: 'Reset failed',
+      loadFailed: 'Could not read reset cards',
+      autoFiveHour: 'Auto-use (5h) · trigger at {threshold}% used',
+      autoWeek: 'Auto-use (weekly) · trigger at {threshold}% used',
+      autoImmediate: 'Currently {used} used — already past the threshold: turning this on spends a card immediately',
+      autoSaveFailed: 'Could not save the switch — retry',
+      autoPersistFailed: 'Switch applied, but it could not be written to disk (lost on restart)',
+      autoLastOk: 'Last auto-reset: {window} · {time}',
+      autoLastFail: 'Last auto-reset failed: {message}',
     },
   },
 }
@@ -207,6 +262,42 @@ const FLOAT_STYLE_TEXT = `
 .dqw-win-mid { opacity: .65; white-space: nowrap; }
 .dqw-win-used { opacity: .65; white-space: nowrap; }
 .dqw-win-val { min-width: 0; font-weight: 600; }
+/* Reset cards: a bordered block below the window grid. Every control is a real
+   <button> so keyboard focus and the disabled state come from the platform. */
+.dqw-reset { border-top: 1px dashed var(--dsw-alias-border-secondary, rgba(128,128,128,.25)); padding-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+.dqw-reset-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 10px; line-height: 14px; }
+.dqw-reset-title { opacity: .65; }
+.dqw-reset-reload { border: 0; background: none; padding: 0; font: inherit; font-size: 10px; color: var(--dsw-alias-label-secondary, inherit); opacity: .65; cursor: pointer; text-decoration: underline; }
+.dqw-reset-reload:hover { opacity: 1; }
+.dqw-reset-reload:disabled { cursor: default; opacity: .35; text-decoration: none; }
+.dqw-reset-row { display: flex; align-items: center; gap: 8px; font-size: 10.5px; line-height: 17px; font-variant-numeric: tabular-nums; }
+.dqw-reset-label { flex: 1; min-width: 0; opacity: .65; }
+.dqw-reset-count { flex: none; font-weight: 600; }
+.dqw-reset-count.is-empty { font-weight: 400; opacity: .5; }
+.dqw-reset-use { flex: none; border: 1px solid var(--dsw-alias-border-secondary, rgba(128,128,128,.4)); border-radius: 5px; background: var(--dsw-alias-bg-elevated, rgba(128,128,128,.1)); color: inherit; font: inherit; font-weight: 400; font-size: 10px; line-height: 14px; padding: 1px 7px; cursor: pointer; }
+.dqw-reset-use:hover:not(:disabled) { background: var(--dsw-alias-bg-hover, rgba(128,128,128,.2)); }
+.dqw-reset-use:disabled { cursor: default; opacity: .4; }
+.dqw-reset-confirm { border: 1px solid var(--dsw-alias-label-warning, #d29922); border-radius: 6px; padding: 6px 8px; display: flex; flex-direction: column; gap: 5px; font-size: 10.5px; line-height: 15px; }
+.dqw-reset-confirm-title { font-weight: 600; }
+.dqw-reset-confirm-body { opacity: .8; }
+.dqw-reset-confirm-warn { opacity: .65; }
+.dqw-reset-confirm-actions { display: flex; gap: 6px; justify-content: flex-end; }
+.dqw-reset-btn { border: 1px solid var(--dsw-alias-border-secondary, rgba(128,128,128,.4)); border-radius: 5px; background: var(--dsw-alias-bg-elevated, rgba(128,128,128,.1)); color: inherit; font: inherit; font-weight: 400; font-size: 10px; line-height: 14px; padding: 2px 9px; cursor: pointer; }
+.dqw-reset-btn:hover:not(:disabled) { background: var(--dsw-alias-bg-hover, rgba(128,128,128,.2)); }
+.dqw-reset-btn:disabled { cursor: default; opacity: .5; }
+.dqw-reset-btn.is-primary { border-color: var(--dsw-alias-label-warning, #d29922); }
+.dqw-reset-notice { font-size: 10px; line-height: 14px; }
+.dqw-reset-notice.is-ok { color: var(--dsw-alias-label-success, #3fb950); }
+.dqw-reset-notice.is-error { color: var(--dsw-alias-label-danger, #c93c3c); }
+.dqw-reset-auto { font-size: 10px; line-height: 14px; opacity: .6; }
+/* Auto-use switches: a real checkbox per window, backed by a host-side file so
+   automatic spending keeps working while no browser is open. */
+.dqw-auto { display: flex; flex-direction: column; gap: 1px; }
+.dqw-auto-row { display: flex; align-items: center; gap: 6px; font-size: 10.5px; line-height: 16px; cursor: pointer; }
+.dqw-auto-box { width: 12px; height: 12px; margin: 0; flex: none; cursor: pointer; accent-color: var(--dsw-alias-button-primary-fill, #5b8def); }
+.dqw-auto-box:disabled { cursor: default; }
+.dqw-auto-label { opacity: .75; }
+.dqw-auto-hint { font-size: 10px; line-height: 14px; padding-left: 18px; color: var(--dsw-alias-label-warning, #d29922); }
 .dqw-error { margin: 0; font-size: 10px; line-height: 14px; color: var(--dsw-alias-label-warning, #b46900); }
 `
 
@@ -375,6 +466,33 @@ async function fetchJson(fetchImpl, path, method) {
   })
   if (!response.ok) throw new Error(`HTTP ${response.status}`)
   return response.json()
+}
+
+/**
+ * Client timeout for the reset flow. It is far longer than a poll: the host chains
+ * list → use → list → quota probe, and a slow upstream leg must not make the browser
+ * abandon a request whose card may already have been consumed.
+ */
+const RESET_FETCH_TIMEOUT_MS = 60_000
+
+/**
+ * The reset endpoints always answer with a JSON envelope — including business
+ * refusals, which arrive non-2xx. So the parsed payload wins over the status code;
+ * only a non-JSON response becomes a transport error.
+ */
+async function fetchResetEnvelope(fetchImpl, path, body) {
+  const response = await fetchImpl(path, {
+    ...(body !== undefined
+      ? { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }
+      : {}),
+    cache: 'no-store',
+    signal: AbortSignal.timeout(RESET_FETCH_TIMEOUT_MS),
+  })
+  const payload = await response.json().catch(() => undefined)
+  if (payload === undefined || typeof payload !== 'object' || payload === null) {
+    throw new Error(`HTTP ${response.status}`)
+  }
+  return payload
 }
 
 /** Mount a self-healing sidebar card. Dependencies are injectable for DOM tests. */
@@ -652,6 +770,15 @@ export function mountQuotaCard({
   let queuedPlace = false
   let openKey
   let panelNav = false
+  // Reset-card state is client-local: the card list is fetched only while the GLM
+  // detail is open, so a closed panel never costs an extra upstream round trip.
+  let resetInfo           // last listResetCards payload (or a synthesized error)
+  let resetLoading = false
+  let resetPending        // reset type awaiting confirmation, or undefined
+  let resetBusy           // reset type currently being spent, or undefined
+  let resetNotice         // { kind: 'ok' | 'error', message }
+  let autoSaving = false  // an auto-reset switch write is in flight
+  let autoSaveError       // last switch-write failure, shown in the panel
   // Cold until the first successful render: a mount whose first poll fails or
   // stalls must behave like the documented no-data state (hidden shell, fast
   // retries), not like a warm client showing an empty capsule.
@@ -796,6 +923,241 @@ export function mountQuotaCard({
     panel.append(overviewActions())
   }
 
+  /**
+   * Fetch the reset-card list and repaint the open panel.
+   * Called when the GLM detail opens and after a spend; never on the poller, so a
+   * closed panel costs nothing upstream.
+   */
+  async function loadResetCards() {
+    if (resetLoading || disposed) return
+    resetLoading = true
+    if (openKey === 'glm') syncPop()
+    try {
+      const payload = await fetchResetEnvelope(fetchImpl, CLIENT_ROUTES.resetCards)
+      resetInfo = payload
+    } catch {
+      resetInfo = { ok: false, error: 'request-failed' }
+    } finally {
+      resetLoading = false
+    }
+    if (!disposed && openKey === 'glm') syncPop()
+  }
+
+  /**
+   * Spend one card.
+   * The confirmation is cleared first so a double click cannot fire twice, and the
+   * button stays disabled for the whole round trip — the host may already have spent
+   * the card even if this request later fails.
+   */
+  async function spendResetCard(resetType) {
+    if (resetBusy !== undefined || disposed) return
+    resetBusy = resetType
+    resetPending = undefined
+    resetNotice = undefined
+    if (openKey === 'glm') syncPop()
+    try {
+      const payload = await fetchResetEnvelope(fetchImpl, CLIENT_ROUTES.resetUse, { resetType })
+      if (payload.ok === true) {
+        resetNotice = { kind: 'ok', message: copy.resetCards.succeeded }
+        // The host returns the post-reset card list; fall back to a re-list when it
+        // could not refresh, so the panel never offers a card that is already gone.
+        resetInfo = payload.cards !== undefined ? { ok: true, cards: payload.cards } : resetInfo
+      } else {
+        resetNotice = { kind: 'error', message: payload.message ?? copy.resetCards.failed }
+      }
+    } catch {
+      resetNotice = { kind: 'error', message: copy.resetCards.failed }
+    } finally {
+      resetBusy = undefined
+    }
+    await loadResetCards()
+    // The host already re-probed the quota; pulling the overview repaints the
+    // window grid with the post-reset percentages.
+    if (!disposed) void poll()
+  }
+
+  /** Build one reset row: label, remaining count and the confirm button. */
+  function renderResetRow(type, model) {
+    const row = doc.createElement('div')
+    row.className = 'dqw-reset-row'
+    row.append(text(doc, 'span', 'dqw-reset-label', type === 'WEEK' ? copy.resetCards.week : copy.resetCards.fiveHour))
+    const count = model.length
+    row.append(text(doc, 'span', `dqw-reset-count${count === 0 ? ' is-empty' : ''}`, count === 0
+      ? copy.resetCards.none
+      : copy.resetCards.count.replace('{count}', formatNumber(count, locale))))
+    const button = doc.createElement('button')
+    button.type = 'button'
+    button.className = 'dqw-reset-use'
+    button.textContent = resetPending === type ? copy.resetCards.cancel : copy.resetCards.use
+    // While this window's request is in flight the card may already be spent, so the
+    // button is fully disabled (not just click-guarded) for the whole round trip.
+    if (resetBusy === type) {
+      button.textContent = copy.resetCards.working
+      button.disabled = true
+    } else {
+      button.disabled = count === 0 || resetBusy !== undefined
+    }
+    button.addEventListener('click', () => {
+      if (resetBusy !== undefined) return
+      resetPending = resetPending === type ? undefined : type
+      resetNotice = undefined
+      syncPop()
+    })
+    row.append(button)
+    return row
+  }
+
+  /**
+   * Write one window's automatic-card-use switch to the host.
+   * The whole config is sent because the host normalizes a complete object; a
+   * partial patch would silently drop the other window's threshold.
+   */
+  async function saveAutoReset(configKey, enabled) {
+    if (autoSaving || disposed) return
+    const current = snapshot?.autoReset
+    const next = {
+      fiveHour: {
+        enabled: current?.fiveHour?.enabled === true,
+        threshold: current?.fiveHour?.threshold ?? AUTO_RESET_THRESHOLD_FALLBACK,
+      },
+      week: {
+        enabled: current?.week?.enabled === true,
+        threshold: current?.week?.threshold ?? AUTO_RESET_THRESHOLD_FALLBACK,
+      },
+    }
+    next[configKey].enabled = enabled === true
+    autoSaving = true
+    autoSaveError = undefined
+    if (openKey === 'glm') syncPop()
+    try {
+      const payload = await fetchResetEnvelope(fetchImpl, CLIENT_ROUTES.autoReset, next)
+      if (payload.ok !== true) autoSaveError = payload.message ?? copy.resetCards.autoSaveFailed
+      else if (payload.autoReset?.persistError !== undefined) autoSaveError = copy.resetCards.autoPersistFailed
+    } catch {
+      autoSaveError = copy.resetCards.autoSaveFailed
+    } finally {
+      autoSaving = false
+    }
+    // Pull the authoritative state back from the host rather than trusting the
+    // local guess: the host may have clamped a threshold or refused the write.
+    if (!disposed) await poll()
+    if (!disposed && openKey === 'glm') syncPop()
+  }
+
+  /** One auto-reset switch row, with a warning when enabling would fire at once. */
+  function renderAutoResetRow(windowKey, configKey, entry, auto) {
+    const wrap = doc.createElement('div')
+    wrap.className = 'dqw-auto'
+    const row = doc.createElement('label')
+    row.className = 'dqw-auto-row'
+    const box = doc.createElement('input')
+    box.type = 'checkbox'
+    box.className = 'dqw-auto-box'
+    box.checked = entry?.enabled === true
+    box.disabled = autoSaving === true
+    box.addEventListener('change', () => { void saveAutoReset(configKey, box.checked) })
+    const threshold = typeof entry?.threshold === 'number' ? entry.threshold : AUTO_RESET_THRESHOLD_FALLBACK
+    row.append(box, text(doc, 'span', 'dqw-auto-label',
+      (windowKey === '5h' ? copy.resetCards.autoFiveHour : copy.resetCards.autoWeek)
+        .replace('{threshold}', formatNumber(threshold, locale))))
+    wrap.append(row)
+
+    // Usage is already past the threshold: turning this on spends a card at the
+    // very next poll, which the user should know before ticking the box.
+    const provider = (snapshot?.providers ?? []).find((item) => item?.key === 'glm')
+    const used = (provider?.plan?.windows ?? []).find((window) => window?.key === windowKey)?.percent
+    if (entry?.enabled !== true && typeof used === 'number' && used >= threshold) {
+      wrap.append(text(doc, 'div', 'dqw-auto-hint',
+        copy.resetCards.autoImmediate.replace('{used}', formatPercent(used, locale))))
+    }
+    return wrap
+  }
+
+  /** The reset block: counts, per-type reset buttons, inline confirm and last result. */
+  function renderResetSection() {
+    const section = doc.createElement('div')
+    section.className = 'dqw-reset'
+    const head = doc.createElement('div')
+    head.className = 'dqw-reset-head'
+    head.append(text(doc, 'span', 'dqw-reset-title', copy.resetCards.section))
+    const reload = doc.createElement('button')
+    reload.type = 'button'
+    reload.className = 'dqw-reset-reload'
+    reload.textContent = resetLoading ? copy.loading : copy.resetCards.reload
+    reload.disabled = resetLoading || resetBusy !== undefined
+    reload.addEventListener('click', () => { loadResetCards() })
+    head.append(reload)
+    section.append(head)
+
+    const cards = resetInfo?.ok === true && resetInfo.cards !== undefined ? resetInfo.cards : undefined
+    if (cards === undefined) {
+      // Nothing fetched yet, a failed fetch, or no GLM credential on the host: say so
+      // instead of drawing two rows of zeroes that look like "no cards left".
+      const message = resetLoading
+        ? copy.loading
+        : resetInfo?.message ?? (resetInfo === undefined ? copy.loading : copy.resetCards.loadFailed)
+      section.append(text(doc, 'p', 'dqw-muted', message))
+      return section
+    }
+
+    const week = Array.isArray(cards.week) ? cards.week : []
+    const fiveHour = Array.isArray(cards.fiveHour) ? cards.fiveHour : []
+    section.append(renderResetRow('FIVE_HOUR', fiveHour))
+    section.append(renderResetRow('WEEK', week))
+
+    // Auto-reset switches. These are real controls backed by a host-side settings
+    // file, not browser state: automatic spending has to keep working while no
+    // browser is open, which is exactly when it matters.
+    const auto = snapshot?.autoReset
+    if (auto !== undefined && typeof auto === 'object') {
+      section.append(renderAutoResetRow('5h', 'fiveHour', auto.fiveHour, auto))
+      section.append(renderAutoResetRow('week', 'week', auto.week, auto))
+      const last = auto.lastEvent
+      if (last?.kind === 'auto') {
+        section.append(text(doc, 'div', 'dqw-reset-notice is-ok',
+          copy.resetCards.autoLastOk
+            .replace('{window}', last.window ?? '')
+            .replace('{time}', formatTime(new Date(last.at).toISOString(), locale) ?? '')))
+      } else if (last?.kind === 'auto-failed') {
+        section.append(text(doc, 'div', 'dqw-reset-notice is-error',
+          copy.resetCards.autoLastFail.replace('{message}', last.message ?? '')))
+      }
+      if (auto.persistError !== undefined) {
+        section.append(text(doc, 'div', 'dqw-reset-notice is-error', copy.resetCards.autoPersistFailed))
+      }
+    }
+
+    if (resetPending !== undefined) {
+      const box = doc.createElement('div')
+      box.className = 'dqw-reset-confirm'
+      box.append(text(doc, 'div', 'dqw-reset-confirm-title', copy.resetCards.confirmTitle))
+      box.append(text(doc, 'div', 'dqw-reset-confirm-body', resetPending === 'WEEK'
+        ? copy.resetCards.confirmWeek
+        : copy.resetCards.confirmFiveHour))
+      box.append(text(doc, 'div', 'dqw-reset-confirm-warn', copy.resetCards.confirmIrreversible))
+      const actions = doc.createElement('div')
+      actions.className = 'dqw-reset-confirm-actions'
+      const cancel = doc.createElement('button')
+      cancel.type = 'button'
+      cancel.className = 'dqw-reset-btn'
+      cancel.textContent = copy.resetCards.cancel
+      cancel.addEventListener('click', () => { resetPending = undefined; syncPop() })
+      const confirm = doc.createElement('button')
+      confirm.type = 'button'
+      confirm.className = 'dqw-reset-btn is-primary'
+      confirm.textContent = copy.resetCards.ok
+      confirm.addEventListener('click', () => { spendResetCard(resetPending) })
+      actions.append(cancel, confirm)
+      box.append(actions)
+      section.append(box)
+    }
+
+    if (resetNotice !== undefined) {
+      section.append(text(doc, 'div', `dqw-reset-notice is-${resetNotice.kind}`, resetNotice.message))
+    }
+    return section
+  }
+
   function renderDetail(detail, key, provider, fromPanelNav = false) {
     detail.replaceChildren()
     detail.append(panelHeader({ title: copy.providerNames[key], showBack: fromPanelNav }))
@@ -875,6 +1237,18 @@ export function mountQuotaCard({
           models.append(row)
         }
         detail.append(models)
+      }
+      // The reset block only makes sense with a configured GLM credential: without
+      // one there are no cards to list, and rendering it would show a perpetual
+      // "loading" line that can never resolve.
+      if (provider?.credential === 'configured') {
+        detail.append(renderResetSection())
+        // Cards are fetched lazily: opening the GLM detail is the first moment the
+        // list is worth an upstream call, and the fetch repaints this panel when it
+        // lands.
+        if (resetInfo === undefined && !resetLoading) {
+          void loadResetCards()
+        }
       }
       return
     }

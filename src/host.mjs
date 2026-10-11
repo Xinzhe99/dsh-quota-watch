@@ -1,4 +1,5 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { credentialKey, credentialRef, isCredentialRefName } from '@deepseek-ai/dsh-credentials'
@@ -144,22 +145,31 @@ export function resolveAutoResetSettingsPath(env = process.env) {
 
 /**
  * Read the saved auto-reset switches.
- * A missing, unreadable or malformed file reads as "nothing saved" so a bad file
- * can never stop the plugin from loading; the profile config is the fallback.
+ * Only a genuinely missing file falls back to the profile config. An unreadable
+ * or corrupt saved file fails CLOSED to both switches off: otherwise a previously
+ * disabled switch could silently revive from an enabled profile default.
  */
 export function readAutoResetSettings(path) {
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8'))
-    return asRecord(parsed?.autoReset) ?? undefined
-  } catch {
-    return undefined
+    return asRecord(parsed?.autoReset) ?? normalizeAutoResetConfig(undefined)
+  } catch (error) {
+    return error?.code === 'ENOENT' ? undefined : normalizeAutoResetConfig(undefined)
   }
 }
 
-/** Persist the auto-reset switches; throws so the caller can report the failure. */
+/** Replace the switches atomically; throws so the caller can report a failed write. */
 export function writeAutoResetSettings(path, autoReset) {
-  mkdirSync(dirname(path), { recursive: true })
-  writeFileSync(path, `${JSON.stringify({ autoReset }, null, 2)}\n`, 'utf8')
+  const directory = dirname(path)
+  mkdirSync(directory, { recursive: true })
+  const tempPath = join(directory, `.quota-reset-${randomUUID()}.tmp`)
+  try {
+    writeFileSync(tempPath, `${JSON.stringify({ autoReset }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+    renameSync(tempPath, path)
+  } catch (error) {
+    try { unlinkSync(tempPath) } catch { /* No temp file when opening failed. */ }
+    throw error
+  }
 }
 
 export function createQuotaService(ctx, options = {}) {
@@ -217,8 +227,8 @@ export function createQuotaService(ctx, options = {}) {
    * Enabling a window re-arms it and clears its backoff, because the reason to
    * enable one is usually "we are about to run out right now" — carrying a stale
    * disarm or backoff over from a previous state would silently do nothing.
-   * Disabling never touches the guards, so off-then-on in one episode cannot
-   * double-spend by accident.
+   * Disabling never touches the guards, but off-then-on deliberately re-arms:
+   * treat re-enabling as a new, potentially immediate spending authorization.
    */
   function updateAutoResetConfig(patch) {
     const previous = autoResetConfig
@@ -256,6 +266,7 @@ export function createQuotaService(ctx, options = {}) {
           displayName: provider.displayName,
           status: provider.status,
           credential: provider.credential,
+          ...(provider.providerId !== undefined ? { providerId: provider.providerId } : {}),
           ...(provider.updatedAt !== undefined ? { updatedAt: provider.updatedAt } : {}),
           ...(provider.checkedAt !== undefined ? { checkedAt: provider.checkedAt } : {}),
           ...(provider.error !== undefined ? { error: provider.error } : {}),
@@ -299,6 +310,11 @@ export function createQuotaService(ctx, options = {}) {
     ;(options.logMirror ?? console)[level]?.(line)
   }
 
+  function logAuto(level, line) {
+    ctx.logger?.[level]?.(line)
+    ;(options.logMirror ?? console)[level]?.(line)
+  }
+
   function markMissing(key, displayName) {
     const from = providers.get(key)?.status
     providers.set(key, {
@@ -326,7 +342,7 @@ export function createQuotaService(ctx, options = {}) {
     logTransition(key, from, 'ready')
   }
 
-  function markGlmPlanSuccess(plan) {
+  function markGlmPlanSuccess(plan, providerId) {
     const previous = providers.get('glm')
     const at = now()
     providers.set('glm', {
@@ -336,6 +352,9 @@ export function createQuotaService(ctx, options = {}) {
       credential: 'configured',
       updatedAt: at,
       checkedAt: at,
+      // Which configured route answered (zai-coding-cn / zai / zai-coding): the
+      // client gates the domestic-only reset-card section on this field.
+      ...(providerId !== undefined ? { providerId } : {}),
       plan,
       ...(previous?.usage !== undefined ? { usage: previous.usage } : {}),
     })
@@ -445,7 +464,7 @@ export function createQuotaService(ctx, options = {}) {
       const { status, body } = await fetchBody(spec)
       const plan = parseGlmPlan(status, body)
       if (plan === undefined) throw Object.assign(new Error(), { code: 'UNRECOGNIZED_RESPONSE' })
-      markGlmPlanSuccess(plan)
+      markGlmPlanSuccess(plan, provider)
     } catch (error) {
       markFailure('glm', 'GLM Coding Plan', error)
       return
@@ -515,11 +534,15 @@ export function createQuotaService(ctx, options = {}) {
   // on demand (opening the panel, or right before spending one), and a failed fetch
   // must never blank the provider rows the poller maintains.
   let resetState
+  let resetSpendInFlight = false
 
   /** Resolve the GLM provider + key, or report why no reset can be attempted. */
   async function resetCredential() {
     const provider = configuredGlmProvider(ctx)
     if (provider === undefined) return { error: 'no-provider', message: '未配置 GLM provider' }
+    // The reset API contract is verified only for domestic personal plans; never
+    // send an international key to the domestic write endpoint, even via direct HTTP.
+    if (provider !== PROVIDER_IDS.glmDomestic) return { error: 'unsupported-provider', message: '仅支持国内站个人版 GLM provider' }
     const apiKey = await resolveGlmCredential(ctx, provider)
     if (apiKey === undefined) return { error: 'no-credential', message: '未找到 GLM API Key' }
     return { provider, apiKey }
@@ -557,7 +580,17 @@ export function createQuotaService(ctx, options = {}) {
    * used; this function re-lists first so the choice is made against live state,
    * then re-probes the quota so the panel reflects the reset immediately.
    */
-  async function useResetCard({ resetType, recordId } = {}) {
+  async function useResetCard(args = {}, autoWindowKey) {
+    if (resetSpendInFlight) return { ok: false, error: 'busy', message: '重置操作进行中，请稍后重试' }
+    resetSpendInFlight = true
+    try {
+      return await performResetCard(args, autoWindowKey)
+    } finally {
+      resetSpendInFlight = false
+    }
+  }
+
+  async function performResetCard({ resetType, recordId } = {}, autoWindowKey) {
     const type = normalizeResetType(resetType)
     if (type === undefined) return { ok: false, error: 'invalid-type', message: '未知的重置类型' }
     const credential = await resetCredential()
@@ -575,6 +608,26 @@ export function createQuotaService(ctx, options = {}) {
       const { message, kind } = classifyProbeError(error)
       resetState = { status: 'error', error: message, errorKind: kind, checkedAt: now() }
       return { ok: false, error: 'list-failed', message }
+    }
+
+    if (autoWindowKey !== undefined) {
+      const current = providers.get('glm')
+      const window = current?.plan?.windows?.find((row) => row?.key === autoWindowKey)
+      const config = autoResetConfigFor(autoResetConfig, autoWindowKey)
+      const decision = evaluateAutoReset({
+        enabled: config.enabled,
+        threshold: config.threshold,
+        used: window?.percent,
+        armed: autoResetArmed[autoWindowKey],
+        lastAttemptAt: autoResetLastAttempt[autoWindowKey],
+        now: now(),
+      })
+      // List/credential awaits give manual spending, a new probe or a switch-off
+      // time to intervene. Recheck *after* them, immediately before the POST.
+      if (windowKeyForResetType(type) !== autoWindowKey || current?.status !== 'ready' || !decision.spend) {
+        return { ok: false, error: 'auto-skipped', message: '自动重置条件已变化，未消耗卡' }
+      }
+      autoResetLastAttempt[autoWindowKey] = now()
     }
 
     const picked = pickResetCard(cards, type, recordId)
@@ -600,13 +653,22 @@ export function createQuotaService(ctx, options = {}) {
     })
     if (spec === undefined) return { ok: false, error: 'invalid-spec', message: '重置请求参数无效' }
 
+    // A timed-out/non-JSON/non-200 POST can have consumed a card upstream. Do not
+    // silently retry it at the next backoff boundary without a fresh user decision.
+    const unknownOutcome = () => {
+      const windowKey = windowKeyForResetType(type)
+      if (windowKey !== undefined) autoResetArmed[windowKey] = false
+      const additionallyCleared = resetWindow(type)?.alsoClears
+      if (additionallyCleared !== undefined) autoResetArmed[additionallyCleared] = false
+      return { ok: false, error: 'request-unknown', message: '重置结果未知；请先核实卡数与额度，再决定是否重试' }
+    }
     let outcome
     try {
       const { status, body } = await postJson(spec)
+      if (status !== 200 || typeof body?.success !== 'boolean') return unknownOutcome()
       outcome = parseResetUseResult(status, body)
-    } catch (error) {
-      const { message } = classifyProbeError(error)
-      return { ok: false, error: 'request-failed', message }
+    } catch {
+      return unknownOutcome()
     }
     if (!outcome.ok) {
       // A refusal can mean the card was consumed by another client; re-list so the
@@ -615,9 +677,16 @@ export function createQuotaService(ctx, options = {}) {
       return { ok: false, error: 'rejected', message: outcome.message }
     }
 
+    // Disarm immediately after a confirmed spend, BEFORE follow-up network calls.
+    // A weekly card also clears the 5h window; disarming both avoids spending a
+    // second card on a snapshot captured before the weekly reset took effect.
+    const cleared = resetWindow(type)
+    const spentWindow = windowKeyForResetType(type)
+    if (spentWindow !== undefined) autoResetArmed[spentWindow] = false
+    if (cleared?.alsoClears !== undefined) autoResetArmed[cleared.alsoClears] = false
+
     // The card is gone now: refresh both the card list and the quota windows so the
     // panel shows the post-reset state without a manual reload.
-    const cleared = resetWindow(type)
     const after = await listResetCards()
     await probeGlm()
     updatedAt = now()
@@ -639,9 +708,9 @@ export function createQuotaService(ctx, options = {}) {
 
   /**
    * Spend a card automatically when an enabled window crosses its threshold.
-   * Called once per poll round, after the probes have landed. Every branch either
-   * spends at most one card or records why it did not — silence is never an option,
-   * because a silent auto-spend would be indistinguishable from a leak.
+   * Called once per poll round, after the probes have landed. Disabled, stale,
+   * already-spent and no-data windows skip without noisy per-poll logging; every
+   * actual POST attempt records success or failure for the panel and host log.
    *
    * The whole body is guarded: this runs on the poll timer, where a throw becomes
    * an unhandled rejection and takes the host process down with it. A defect in
@@ -650,13 +719,18 @@ export function createQuotaService(ctx, options = {}) {
   async function maybeAutoReset() {
     if (disposed) return
     try {
-      const provider = providers.get('glm')
-      const windows = Array.isArray(provider?.plan?.windows) ? provider.plan.windows : undefined
-      for (const resetType of ['FIVE_HOUR', 'WEEK']) {
+      // Never spend from markFailure's last-good (stale) plan: its percent may
+      // describe a window that has already rolled over or been manually reset.
+      if (providers.get('glm')?.status !== 'ready') return
+      // Weekly cards clear 5h too. Evaluate them first, and read the current plan
+      // per iteration instead of keeping the pre-spend snapshot for both windows.
+      for (const resetType of ['WEEK', 'FIVE_HOUR']) {
         const windowKey = windowKeyForResetType(resetType)
         if (windowKey === undefined) continue
+        const provider = providers.get('glm')
+        if (provider?.status !== 'ready') break
         const config = autoResetConfigFor(autoResetConfig, windowKey)
-        const row = windows?.find((window) => window?.key === windowKey)
+        const row = provider.plan?.windows?.find((window) => window?.key === windowKey)
         const decision = evaluateAutoReset({
           enabled: config.enabled,
           threshold: config.threshold,
@@ -668,8 +742,11 @@ export function createQuotaService(ctx, options = {}) {
         if (decision.rearm === true) autoResetArmed[windowKey] = true
         if (!decision.spend) continue
 
+        const result = await useResetCard({ resetType }, windowKey)
+        if (result.error === 'auto-skipped' || result.error === 'busy') continue
+        // Includes list failures: they must still respect the 10-minute retry
+        // backoff. A skip/busy is not a real attempt and must not start one.
         autoResetLastAttempt[windowKey] = now()
-        const result = await useResetCard({ resetType })
         if (result.ok === true) {
           // Disarm until usage drops back below the threshold, which a successful
           // reset causes on the next probe.
@@ -681,7 +758,7 @@ export function createQuotaService(ctx, options = {}) {
             recordId: result.recordId,
             at: now(),
           }
-          ctx.logger?.info?.(`quota-watch: auto-reset spent a ${resetType} card (window ${windowKey} was at or past ${config.threshold}%)`)
+          logAuto('info', `quota-watch: auto-reset spent a ${resetType} card (window ${windowKey} was at or past ${config.threshold}%)`)
         } else {
           autoResetEvent = {
             kind: 'auto-failed',
@@ -690,13 +767,13 @@ export function createQuotaService(ctx, options = {}) {
             at: now(),
             message: result.message,
           }
-          ctx.logger?.warn?.(`quota-watch: auto-reset for ${windowKey} failed: ${result.message}`)
+          logAuto('warn', `quota-watch: auto-reset for ${windowKey} failed (${result.error ?? 'unknown'})`)
         }
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       autoResetEvent = { kind: 'auto-failed', window: 'unknown', at: now(), message }
-      ctx.logger?.warn?.(`quota-watch: auto-reset check failed: ${message}`)
+      logAuto('warn', `quota-watch: auto-reset check failed: ${message}`)
     }
   }
 

@@ -1,15 +1,19 @@
 # Mount the host-side quota watcher; the browser half is supplied by dsh.client.
 #
-# autoReset: when a window's used% reaches its threshold, spend the earliest-expiring
-# available reset card of that window automatically. Both windows default to disabled;
-# the panel's checkboxes persist overrides to
-#   $DSH_HOME/glm-quota-reset/settings.json
-# which win over these initial values.
-#   fiveHour.enabled / week.enabled : true to arm (default false)
+# autoReset is a REAL, irreversible redemption, not a read-only quota probe.
+# The panel header's "Auto-use" checkbox merely expands settings; only the two
+# per-window enabled switches authorize host-side spending. Both default OFF.
+# Panel changes atomically replace $DSH_HOME/glm-quota-reset/settings.json and
+# override this initial profile config; a corrupt/unreadable saved file fails OFF.
+# A missing saved file uses these values — setting enabled:true here deliberately
+# arms auto-use after startup even without any browser open.
+#   fiveHour.enabled / week.enabled : explicit authorization (default false)
 #   fiveHour.threshold / week.threshold : used-percent trigger, 50-99.9 (default 99.9)
-#   pollIntervalSec : quota check cadence in seconds (30-3600). A late threshold is
-#     only useful if the check can see the crossing — keep this well under the time
-#     a busy run takes to burn the remaining headroom.
+#   pollIntervalSec : quota check cadence in seconds (30-3600). Fast consumption
+#     between two probes may exceed the limit before any automatic reset can fire.
+# Only fresh domestic personal-plan data may trigger a spend. Weekly cards clear
+# both week and 5h; a timed-out / ambiguous POST disables further auto retries
+# until the quota falls below threshold or the switch is deliberately re-armed.
 - insert:
     - id: quota-watch
       name: '@iasiv5/dsh-quota-watch'

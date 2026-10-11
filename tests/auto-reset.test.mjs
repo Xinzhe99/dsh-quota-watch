@@ -12,7 +12,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createQuotaService, readAutoResetSettings, writeAutoResetSettings, resolveAutoResetSettingsPath } from '../src/host.mjs'
@@ -69,7 +69,7 @@ function stubCtx(logs = []) {
   return {
     logger: { info: (line) => logs.push(line), warn: (line) => logs.push(line) },
     settings: {
-      describe: () => [{ ns: 'llm-pi-ai', value: { providers: { zai: { apiKeyEnv: 'ZAI_API_KEY' } } } }],
+      describe: () => [{ ns: 'llm-pi-ai', value: { providers: { 'zai-coding-cn': { apiKeyEnv: 'ZAI_API_KEY' } } } }],
     },
     credentials: {
       resolve: async () => ({ value: 'sk-test' }),
@@ -276,6 +276,7 @@ test('updateAutoResetConfig persists, and a new service reads the saved switches
     const onDisk = JSON.parse(readFileSync(path, 'utf8'))
     assert.equal(onDisk.autoReset.week.enabled, true)
     assert.equal(onDisk.autoReset.week.threshold, 92)
+    assert.deepEqual(readdirSync(dir), ['settings.json'], 'atomic replacement leaves no temp file')
 
     const second = createQuotaService(stubCtx(), { fetchImpl: stubFetch(), autoResetSettingsPath: path })
     const view = second.overview().autoReset
@@ -287,7 +288,7 @@ test('updateAutoResetConfig persists, and a new service reads the saved switches
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 
-test('a saved file overrides the profile default, and garbage falls back to it', () => {
+test('saved settings override profile config; corrupt settings fail closed instead of reviving profile auto-use', () => {
   const { dir, path } = tempSettingsPath()
   try {
     writeAutoResetSettings(path, { fiveHour: { enabled: true, threshold: 55 }, week: { enabled: false, threshold: 90 } })
@@ -300,15 +301,15 @@ test('a saved file overrides the profile default, and garbage falls back to it',
     assert.equal(service.overview().autoReset.fiveHour.threshold, 55)
     service.stop()
 
-    // A corrupt file must never stop the plugin: it reads as "nothing saved".
+    // A truncated/corrupt file must never restore an enabled profile default.
     writeFileSync(path, '{ this is not json', 'utf8')
-    assert.equal(readAutoResetSettings(path), undefined)
+    assert.equal(readAutoResetSettings(path).week.enabled, false)
     const recovered = createQuotaService(stubCtx(), {
       fetchImpl: stubFetch(),
       autoResetSettingsPath: path,
-      autoReset: { week: { enabled: false, threshold: 90 } },
+      autoReset: { week: { enabled: true, threshold: 90 } },
     })
-    assert.equal(recovered.overview().autoReset.source, 'config')
+    assert.equal(recovered.overview().autoReset.week.enabled, false)
     recovered.stop()
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
@@ -352,6 +353,206 @@ test('a write failure is reported instead of silently pretending success', () =>
     assert.equal(result.autoReset.fiveHour.enabled, true)
     assert.equal(typeof result.autoReset.persistError, 'string', 'but the failure is surfaced')
     assert.equal(service.overview().autoReset.persistError !== undefined, true)
+    assert.deepEqual(readdirSync(dir), ['settings.json'], 'failed rename cleans the temp file')
+    service.stop()
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('international GLM hides domestic entitlement and rejects direct reset calls', async () => {
+  const { dir, path } = tempSettingsPath()
+  try {
+    const ctx = stubCtx()
+    ctx.settings.describe = () => [{ ns: 'llm-pi-ai', value: { providers: { zai: { apiKeyEnv: 'ZAI_API_KEY' } } } }]
+    const fetchImpl = stubFetch()
+    const service = createQuotaService(ctx, { fetchImpl, autoResetSettingsPath: path })
+    await service.refresh()
+    assert.equal(service.overview().providers.find((item) => item.key === 'glm').providerId, 'zai')
+    assert.equal((await service.listResetCards()).error, 'unsupported-provider')
+    assert.equal((await service.useResetCard({ resetType: 'WEEK' })).error, 'unsupported-provider')
+    assert.equal(fetchImpl.calls.filter((call) => call.url.includes('customer-package-reset')).length, 0)
+    service.stop()
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('stale quota plans never trigger an auto-spend, even with a live reset endpoint', async () => {
+  const { dir, path } = tempSettingsPath()
+  try {
+    let failQuota = false
+    const healthy = stubFetch({ plan: WEEK_AT_95 })
+    const fetchImpl = (url, init) => failQuota && String(url).includes('/api/monitor/usage/quota/limit')
+      ? Promise.resolve({ ok: false, status: 503, json: async () => ({}) })
+      : healthy(url, init)
+    const service = createQuotaService(stubCtx(), { fetchImpl, autoResetSettingsPath: path })
+    await service.refresh() // A real high-usage snapshot, but auto-use was off.
+    service.updateAutoResetConfig({ fiveHour: { enabled: false }, week: { enabled: true, threshold: 90 } })
+    failQuota = true
+    await service.refresh()
+    assert.equal(service.overview().providers.find((item) => item.key === 'glm').status, 'stale')
+    assert.equal(healthy.calls.filter((call) => call.url.includes('customer-package-reset/use')).length, 0)
+    service.stop()
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('simultaneous high week and 5h usage spends a weekly card only', async () => {
+  const { dir, path } = tempSettingsPath()
+  try {
+    const bothHigh = structuredClone(WEEK_AT_95)
+    bothHigh.data.limits[0].currentValue = 95
+    const fetchImpl = stubFetch({ plan: bothHigh })
+    const service = createQuotaService(stubCtx(), {
+      fetchImpl, autoResetSettingsPath: path,
+      autoReset: { fiveHour: { enabled: true, threshold: 90 }, week: { enabled: true, threshold: 90 } },
+    })
+    await service.refresh()
+    const uses = fetchImpl.calls.filter((call) => call.url.includes('customer-package-reset/use'))
+    assert.equal(uses.length, 1)
+    assert.equal(JSON.parse(uses[0].body).resetType, 'WEEK')
+    assert.equal(service.overview().autoReset.fiveHour.armed, false)
+    service.stop()
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('automatic list in flight rejects a simultaneous manual spend', async () => {
+  const { dir, path } = tempSettingsPath()
+  try {
+    const healthy = stubFetch({ plan: WEEK_AT_95 })
+    let releaseList, listStarted
+    const gate = new Promise((resolve) => { releaseList = resolve })
+    const entered = new Promise((resolve) => { listStarted = resolve })
+    let firstList = true
+    const fetchImpl = async (url, init) => {
+      if (firstList && String(url).includes('/customer-package-reset/list')) {
+        firstList = false
+        listStarted()
+        await gate
+      }
+      return healthy(url, init)
+    }
+    const service = createQuotaService(stubCtx(), {
+      fetchImpl, autoResetSettingsPath: path, autoReset: { week: { enabled: true, threshold: 90 } },
+    })
+    const poll = service.refresh()
+    await entered
+    assert.equal((await service.useResetCard({ resetType: 'WEEK' })).error, 'busy')
+    releaseList()
+    await poll
+    assert.equal(healthy.calls.filter((call) => call.url.includes('customer-package-reset/use')).length, 1)
+    service.stop()
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('manual list in flight blocks automatic spending and disarms on success', async () => {
+  const { dir, path } = tempSettingsPath()
+  try {
+    const healthy = stubFetch({ plan: WEEK_AT_95 })
+    let releaseList, listStarted
+    const gate = new Promise((resolve) => { releaseList = resolve })
+    const entered = new Promise((resolve) => { listStarted = resolve })
+    let firstList = true
+    const fetchImpl = async (url, init) => {
+      if (firstList && String(url).includes('/customer-package-reset/list')) {
+        firstList = false
+        listStarted()
+        await gate
+      }
+      return healthy(url, init)
+    }
+    const service = createQuotaService(stubCtx(), {
+      fetchImpl, autoResetSettingsPath: path, autoReset: { week: { enabled: true, threshold: 90 } },
+    })
+    const manual = service.useResetCard({ resetType: 'WEEK' })
+    await entered
+    await service.refresh()
+    releaseList()
+    assert.equal((await manual).ok, true)
+    await service.refresh()
+    assert.equal(healthy.calls.filter((call) => call.url.includes('customer-package-reset/use')).length, 1)
+    assert.equal(service.overview().autoReset.week.armed, false)
+    service.stop()
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('a switch-off during the automatic list revalidates and sends no spend POST', async () => {
+  const { dir, path } = tempSettingsPath()
+  try {
+    const healthy = stubFetch({ plan: WEEK_AT_95 })
+    let releaseList, listStarted
+    const gate = new Promise((resolve) => { releaseList = resolve })
+    const entered = new Promise((resolve) => { listStarted = resolve })
+    let firstList = true
+    const fetchImpl = async (url, init) => {
+      if (firstList && String(url).includes('/customer-package-reset/list')) {
+        firstList = false
+        listStarted()
+        await gate
+      }
+      return healthy(url, init)
+    }
+    const service = createQuotaService(stubCtx(), {
+      fetchImpl, autoResetSettingsPath: path, autoReset: { week: { enabled: true, threshold: 90 } },
+    })
+    const poll = service.refresh()
+    await entered
+    service.updateAutoResetConfig({ fiveHour: { enabled: false }, week: { enabled: false } })
+    releaseList()
+    await poll
+    assert.equal(healthy.calls.filter((call) => call.url.includes('customer-package-reset/use')).length, 0)
+    assert.equal(service.overview().autoReset.lastEvent, undefined, 'an intentional skip is not a failed spend')
+    service.stop()
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('failed card listing respects the 10-minute auto retry backoff', async () => {
+  const { dir, path } = tempSettingsPath()
+  try {
+    let clock = 1_000_000
+    const healthy = stubFetch({ plan: WEEK_AT_95 })
+    let listAttempts = 0
+    const fetchImpl = (url, init) => {
+      if (String(url).includes('/customer-package-reset/list')) {
+        listAttempts += 1
+        return Promise.resolve({ ok: false, status: 503, json: async () => ({}) })
+      }
+      return healthy(url, init)
+    }
+    const service = createQuotaService(stubCtx(), {
+      fetchImpl, now: () => clock, autoResetSettingsPath: path,
+      autoReset: { week: { enabled: true, threshold: 90 } },
+    })
+    await service.refresh()
+    await service.refresh()
+    assert.equal(listAttempts, 1)
+    clock += 11 * 60_000
+    await service.refresh()
+    assert.equal(listAttempts, 2)
+    service.stop()
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('ambiguous POST result disarms auto-use instead of retrying after backoff', async () => {
+  const { dir, path } = tempSettingsPath()
+  try {
+    let clock = 1_000_000
+    const healthy = stubFetch({ plan: WEEK_AT_95 })
+    let useAttempts = 0
+    const fetchImpl = (url, init) => {
+      if (String(url).includes('/customer-package-reset/use')) {
+        useAttempts += 1
+        return Promise.reject(new Error('connection ended after request was sent'))
+      }
+      return healthy(url, init)
+    }
+    const service = createQuotaService(stubCtx(), {
+      fetchImpl, now: () => clock, autoResetSettingsPath: path,
+      autoReset: { week: { enabled: true, threshold: 90 } },
+    })
+    await service.refresh()
+    assert.equal(useAttempts, 1)
+    assert.equal(service.overview().autoReset.week.armed, false)
+    assert.match(service.overview().autoReset.lastEvent.message, /结果未知/)
+    clock += 11 * 60_000
+    await service.refresh()
+    assert.equal(useAttempts, 1, 'no automatic retry even after the usual backoff')
     service.stop()
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })

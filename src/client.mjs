@@ -1,6 +1,6 @@
-import { CLIENT_POLL_INTERVAL_MS, CLIENT_ROUTES } from './shared.mjs'
+import { CLIENT_POLL_INTERVAL_MS, CLIENT_ROUTES, PROVIDER_IDS } from './shared.mjs'
 import { remainingToUsed } from './core/adapters.mjs'
-import { MARGIN, clampPoint, loadFloatPosition, loadSurfaceFlags, saveFloatPosition, saveSurfaceFlags, titlebarTopInset } from './client/prefs.mjs'
+import { MARGIN, clampPoint, loadAutoOpen, loadFloatPosition, loadSurfaceFlags, saveAutoOpen, saveFloatPosition, saveSurfaceFlags, titlebarTopInset } from './client/prefs.mjs'
 import { DRAG_SLOP_MOUSE, DRAG_SLOP_TOUCH, parseInset, clampFrame, dragSlop, grabOffset } from './client/drag.mjs'
 
 export const name = 'quota-watch-client'
@@ -60,13 +60,16 @@ const COPY = {
       mcp: 'MCP（月）',
     },
     resetCards: {
-      section: '剩余重置卡',
+      section: '额度重置卡',
       week: '每周重置卡',
       fiveHour: '5 小时重置卡',
       count: '{count} 张',
       none: '无可用',
       use: '重置',
-      reload: '刷新',
+      reloadLink: '（刷新）',
+      autoToggle: '自动用卡',
+      autoActive: '自动用卡·已启用',
+      expiry: '{date} 前有效',
       confirmTitle: '确认使用重置卡？',
       confirmWeek: '将消耗 1 张每周重置卡，立即重置每周额度与 5 小时额度。',
       confirmFiveHour: '将消耗 1 张 5 小时重置卡，立即重置 5 小时额度。',
@@ -126,13 +129,16 @@ const COPY = {
       mcp: 'MCP (month)',
     },
     resetCards: {
-      section: 'Reset cards left',
+      section: 'Quota reset cards',
       week: 'Weekly reset card',
       fiveHour: '5-hour reset card',
       count: '{count}',
       none: 'none',
       use: 'Reset',
-      reload: 'Reload',
+      reloadLink: '(Refresh)',
+      autoToggle: 'Auto-use',
+      autoActive: 'Auto-use · on',
+      expiry: 'expires {date}',
       confirmTitle: 'Use a reset card?',
       confirmWeek: 'This spends 1 weekly reset card and immediately resets both the weekly and 5-hour quotas.',
       confirmFiveHour: 'This spends 1 5-hour reset card and immediately resets the 5-hour quota.',
@@ -270,9 +276,18 @@ const FLOAT_STYLE_TEXT = `
 .dqw-reset-reload { border: 0; background: none; padding: 0; font: inherit; font-size: 10px; color: var(--dsw-alias-label-secondary, inherit); opacity: .65; cursor: pointer; text-decoration: underline; }
 .dqw-reset-reload:hover { opacity: 1; }
 .dqw-reset-reload:disabled { cursor: default; opacity: .35; text-decoration: none; }
-.dqw-reset-row { display: flex; align-items: center; gap: 8px; font-size: 10.5px; line-height: 17px; font-variant-numeric: tabular-nums; }
-.dqw-reset-label { flex: 1; min-width: 0; opacity: .65; }
-.dqw-reset-count { flex: none; font-weight: 600; }
+.dqw-reset-head-left { display: flex; align-items: baseline; min-width: 0; }
+.dqw-reset-head-left.is-en { gap: 4px; }
+.dqw-auto-master { display: flex; align-items: center; gap: 4px; cursor: pointer; font-size: 10px; line-height: 14px; }
+.dqw-auto-master .dqw-auto-box { accent-color: var(--dsw-alias-button-primary-fill, #5b8def); }
+.dqw-reset-lines { display: grid; grid-template-columns: max-content max-content minmax(0, 1fr) max-content max-content; column-gap: 6px; row-gap: 4px; align-items: center; font-size: 10.5px; line-height: 17px; font-variant-numeric: tabular-nums; }
+.dqw-reset-row { display: contents; }
+.dqw-reset-kind { white-space: nowrap; opacity: .65; }
+.dqw-reset-mid { white-space: nowrap; text-align: center; opacity: .65; }
+.dqw-reset-expiry { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: .65; }
+.dqw-reset-count { justify-self: end; white-space: nowrap; font-weight: 600; }
+.dqw-reset-placeholder { min-width: 0; }
+
 .dqw-reset-count.is-empty { font-weight: 400; opacity: .5; }
 .dqw-reset-use { flex: none; border: 1px solid var(--dsw-alias-border-secondary, rgba(128,128,128,.4)); border-radius: 5px; background: var(--dsw-alias-bg-elevated, rgba(128,128,128,.1)); color: inherit; font: inherit; font-weight: 400; font-size: 10px; line-height: 14px; padding: 1px 7px; cursor: pointer; }
 .dqw-reset-use:hover:not(:disabled) { background: var(--dsw-alias-bg-hover, rgba(128,128,128,.2)); }
@@ -329,6 +344,23 @@ function formatPercent(value, locale) {
   const clamped = Math.max(0, Math.min(100, value))
   const rounded = clamped >= 10 ? Math.round(clamped) : Number(clamped.toFixed(1))
   return `${formatNumber(rounded, locale)}%`
+}
+
+/** The earliest expiry among available cards as MM/DD — the card a default spend picks. */
+function earliestExpiryLabel(cards) {
+  const stamps = (Array.isArray(cards) ? cards : [])
+    .map((card) => {
+      const text = typeof card?.expireTime === 'string' ? card.expireTime : ''
+      const parsed = Date.parse(text.replace(' ', 'T') + '+08:00')
+      return Number.isNaN(parsed) ? undefined : parsed
+    })
+    .filter((value) => value !== undefined)
+  if (stamps.length === 0) return undefined
+  const parts = new Intl.DateTimeFormat('en-US', {
+    month: '2-digit', day: '2-digit', timeZone: 'Asia/Shanghai',
+  }).formatToParts(new Date(Math.min(...stamps)))
+  const part = (type) => parts.find((item) => item.type === type)?.value ?? ''
+  return `${part('month')}/${part('day')}`
 }
 
 function formatTime(value, locale) {
@@ -779,6 +811,7 @@ export function mountQuotaCard({
   let resetNotice         // { kind: 'ok' | 'error', message }
   let autoSaving = false  // an auto-reset switch write is in flight
   let autoSaveError       // last switch-write failure, shown in the panel
+  let autoOpen = loadAutoOpen(win.localStorage)  // the header master toggle reveals the auto-use rows
   // Cold until the first successful render: a mount whose first poll fails or
   // stalls must behave like the documented no-data state (hidden shell, fast
   // retries), not like a warm client showing an empty capsule.
@@ -976,15 +1009,25 @@ export function mountQuotaCard({
     if (!disposed) void poll()
   }
 
-  /** Build one reset row: label, remaining count and the confirm button. */
+  /** Render aligned columns: card name · earliest expiry | count | action. */
   function renderResetRow(type, model) {
     const row = doc.createElement('div')
     row.className = 'dqw-reset-row'
-    row.append(text(doc, 'span', 'dqw-reset-label', type === 'WEEK' ? copy.resetCards.week : copy.resetCards.fiveHour))
+    const expiry = earliestExpiryLabel(model)
+    row.append(text(doc, 'span', 'dqw-reset-kind', type === 'WEEK' ? copy.resetCards.week : copy.resetCards.fiveHour))
+    row.append(text(doc, 'span', 'dqw-reset-mid', '·'))
+    row.append(text(doc, 'span', 'dqw-reset-expiry',
+      expiry !== undefined ? copy.resetCards.expiry.replace('{date}', expiry) : '—'))
     const count = model.length
     row.append(text(doc, 'span', `dqw-reset-count${count === 0 ? ' is-empty' : ''}`, count === 0
       ? copy.resetCards.none
       : copy.resetCards.count.replace('{count}', formatNumber(count, locale))))
+    // Nothing to spend and nothing in flight: no button at all — a disabled
+    // 「重置」 on a zero row is noise when the count already says 无可用.
+    if (count === 0 && resetBusy !== type) {
+      row.append(text(doc, 'span', 'dqw-reset-placeholder', ''))
+      return row
+    }
     const button = doc.createElement('button')
     button.type = 'button'
     button.className = 'dqw-reset-use'
@@ -995,7 +1038,7 @@ export function mountQuotaCard({
       button.textContent = copy.resetCards.working
       button.disabled = true
     } else {
-      button.disabled = count === 0 || resetBusy !== undefined
+      button.disabled = resetBusy !== undefined
     }
     button.addEventListener('click', () => {
       if (resetBusy !== undefined) return
@@ -1079,14 +1122,42 @@ export function mountQuotaCard({
     section.className = 'dqw-reset'
     const head = doc.createElement('div')
     head.className = 'dqw-reset-head'
-    head.append(text(doc, 'span', 'dqw-reset-title', copy.resetCards.section))
+    // Left: the title carries the manual reload affordance —「额度重置卡（刷新）」.
+    const headLeft = doc.createElement('div')
+    headLeft.className = `dqw-reset-head-left${locale === 'en' ? ' is-en' : ''}`
+    headLeft.append(text(doc, 'span', 'dqw-reset-title', copy.resetCards.section))
     const reload = doc.createElement('button')
     reload.type = 'button'
     reload.className = 'dqw-reset-reload'
-    reload.textContent = resetLoading ? copy.loading : copy.resetCards.reload
+    reload.textContent = resetLoading ? copy.loading : copy.resetCards.reloadLink
     reload.disabled = resetLoading || resetBusy !== undefined
     reload.addEventListener('click', () => { loadResetCards() })
-    head.append(reload)
+    headLeft.append(reload)
+    head.append(headLeft)
+    // Right: a pure visibility toggle. Checking it only reveals the two auto-use
+    // rows below; actually enabling a window stays with its own per-window switch,
+    // so the default panel is three lines and no single click can arm auto-spend.
+    const autoHeader = snapshot?.autoReset
+    if (autoHeader !== undefined && typeof autoHeader === 'object') {
+      const master = doc.createElement('label')
+      master.className = 'dqw-auto-master'
+      const masterBox = doc.createElement('input')
+      masterBox.type = 'checkbox'
+      masterBox.className = 'dqw-auto-box'
+      masterBox.checked = autoOpen === true
+      masterBox.disabled = autoSaving === true
+      masterBox.addEventListener('change', () => {
+        autoOpen = masterBox.checked
+        saveAutoOpen(win.localStorage, autoOpen)
+        syncPop()
+      })
+      // Expansion is not authorization: disclose the persisted host switch state
+      // even when these rows are collapsed, so an unchecked box cannot imply off.
+      const anyEnabled = autoHeader.fiveHour?.enabled === true || autoHeader.week?.enabled === true
+      master.append(text(doc, 'span', 'dqw-reset-title',
+        anyEnabled ? copy.resetCards.autoActive : copy.resetCards.autoToggle), masterBox)
+      head.append(master)
+    }
     section.append(head)
 
     const cards = resetInfo?.ok === true && resetInfo.cards !== undefined ? resetInfo.cards : undefined
@@ -1102,16 +1173,22 @@ export function mountQuotaCard({
 
     const week = Array.isArray(cards.week) ? cards.week : []
     const fiveHour = Array.isArray(cards.fiveHour) ? cards.fiveHour : []
-    section.append(renderResetRow('FIVE_HOUR', fiveHour))
-    section.append(renderResetRow('WEEK', week))
+    const rows = doc.createElement('div')
+    rows.className = 'dqw-reset-lines'
+    rows.append(renderResetRow('FIVE_HOUR', fiveHour), renderResetRow('WEEK', week))
+    section.append(rows)
 
     // Auto-reset switches. These are real controls backed by a host-side settings
     // file, not browser state: automatic spending has to keep working while no
     // browser is open, which is exactly when it matters.
     const auto = snapshot?.autoReset
     if (auto !== undefined && typeof auto === 'object') {
-      section.append(renderAutoResetRow('5h', 'fiveHour', auto.fiveHour, auto))
-      section.append(renderAutoResetRow('week', 'week', auto.week, auto))
+      // The two auto-use rows stay collapsed behind the header toggle; the event
+      // notices below still render while collapsed so auto activity stays visible.
+      if (autoOpen === true) {
+        section.append(renderAutoResetRow('5h', 'fiveHour', auto.fiveHour, auto))
+        section.append(renderAutoResetRow('week', 'week', auto.week, auto))
+      }
       const last = auto.lastEvent
       if (last?.kind === 'auto') {
         section.append(text(doc, 'div', 'dqw-reset-notice is-ok',
@@ -1238,10 +1315,10 @@ export function mountQuotaCard({
         }
         detail.append(models)
       }
-      // The reset block only makes sense with a configured GLM credential: without
-      // one there are no cards to list, and rendering it would show a perpetual
-      // "loading" line that can never resolve.
-      if (provider?.credential === 'configured') {
+      // The reset block only makes sense with a configured DOMESTIC GLM credential:
+      // the reset endpoints are verified for the domestic personal plan only, so an
+      // international (z.ai) provider would only ever render a permanent failure.
+      if (provider?.credential === 'configured' && provider?.providerId === PROVIDER_IDS.glmDomestic) {
         detail.append(renderResetSection())
         // Cards are fetched lazily: opening the GLM detail is the first moment the
         // list is worth an upstream call, and the fetch repaints this panel when it
